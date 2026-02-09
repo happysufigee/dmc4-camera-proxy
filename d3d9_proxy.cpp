@@ -75,6 +75,17 @@ static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsView = false;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
+static bool g_showFpsStats = true;
+static bool g_freecamEnabled = false;
+static bool g_freecamToggleWasDown = false;
+static bool g_freecamHasState = false;
+static D3DVECTOR g_freecamPosition = {};
+static float g_freecamYaw = 0.0f;
+static float g_freecamPitch = 0.0f;
+static POINT g_freecamLastMouse = {};
+static bool g_freecamHasMouse = false;
+static LARGE_INTEGER g_freecamLastCounter = {};
+static bool g_freecamTimeInitialized = false;
 
 static constexpr int kMaxConstantRegisters = 256;
 static float g_vertexConstants[kMaxConstantRegisters][4] = {};
@@ -192,17 +203,6 @@ static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) 
     ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._41, mat._42, mat._43, mat._44);
 }
 
-static int ClampRegisterBase(int value) {
-    if (value < 0) {
-        return -1;
-    }
-    if (value > kMaxConstantRegisters - 4) {
-        value = kMaxConstantRegisters - 4;
-    }
-    value = (value / 4) * 4;
-    return value;
-}
-
 static bool TryBuildMatrixFromSnapshot(int baseRegister, D3DMATRIX* outMatrix) {
     if (!g_vertexConstantsSnapshotReady || baseRegister < 0 ||
         baseRegister + 3 >= kMaxConstantRegisters) {
@@ -311,18 +311,187 @@ static void UpdateFrameTimeStats() {
     g_frameTimeSamples++;
 }
 
-static void AssignSelectedRegister(int target) {
-    if (g_selectedRegister < 0) {
+static D3DVECTOR AddVector(const D3DVECTOR& a, const D3DVECTOR& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+static D3DVECTOR ScaleVector(const D3DVECTOR& v, float scale) {
+    return {v.x * scale, v.y * scale, v.z * scale};
+}
+
+static float DotVector(const D3DVECTOR& a, const D3DVECTOR& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static D3DVECTOR CrossVector(const D3DVECTOR& a, const D3DVECTOR& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+static D3DVECTOR NormalizeVector(const D3DVECTOR& v) {
+    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len < 0.0001f) {
+        return {0.0f, 0.0f, 0.0f};
+    }
+    return {v.x / len, v.y / len, v.z / len};
+}
+
+static bool InitializeFreecamFromView(const D3DMATRIX& view) {
+    D3DVECTOR right = {view._11, view._12, view._13};
+    D3DVECTOR up = {view._21, view._22, view._23};
+    D3DVECTOR forward = {view._31, view._32, view._33};
+    right = NormalizeVector(right);
+    up = NormalizeVector(up);
+    forward = NormalizeVector(forward);
+
+    D3DVECTOR position = {
+        -(right.x * view._41 + up.x * view._42 + forward.x * view._43),
+        -(right.y * view._41 + up.y * view._42 + forward.y * view._43),
+        -(right.z * view._41 + up.z * view._42 + forward.z * view._43)
+    };
+
+    g_freecamPosition = position;
+    g_freecamYaw = atan2f(forward.x, forward.z);
+    g_freecamPitch = asinf(forward.y);
+    g_freecamHasState = true;
+    g_freecamHasMouse = false;
+    return true;
+}
+
+static D3DMATRIX BuildViewMatrixFromFreecam() {
+    float cosPitch = cosf(g_freecamPitch);
+    float sinPitch = sinf(g_freecamPitch);
+    float cosYaw = cosf(g_freecamYaw);
+    float sinYaw = sinf(g_freecamYaw);
+
+    D3DVECTOR forward = {sinYaw * cosPitch, sinPitch, cosYaw * cosPitch};
+    forward = NormalizeVector(forward);
+    D3DVECTOR worldUp = {0.0f, 1.0f, 0.0f};
+    D3DVECTOR right = NormalizeVector(CrossVector(worldUp, forward));
+    D3DVECTOR up = CrossVector(forward, right);
+
+    D3DMATRIX view = {};
+    view._11 = right.x;
+    view._12 = right.y;
+    view._13 = right.z;
+    view._14 = 0.0f;
+
+    view._21 = up.x;
+    view._22 = up.y;
+    view._23 = up.z;
+    view._24 = 0.0f;
+
+    view._31 = forward.x;
+    view._32 = forward.y;
+    view._33 = forward.z;
+    view._34 = 0.0f;
+
+    view._41 = -DotVector(right, g_freecamPosition);
+    view._42 = -DotVector(up, g_freecamPosition);
+    view._43 = -DotVector(forward, g_freecamPosition);
+    view._44 = 1.0f;
+
+    return view;
+}
+
+static void UpdateFreecamToggle() {
+    bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (down && !g_freecamToggleWasDown) {
+        g_freecamEnabled = !g_freecamEnabled;
+        g_freecamHasState = false;
+        g_freecamTimeInitialized = false;
+        g_freecamHasMouse = false;
+    }
+    g_freecamToggleWasDown = down;
+}
+
+static void UpdateFreecam(IDirect3DDevice9* device, HWND hwnd) {
+    if (!g_freecamEnabled || !device) {
         return;
     }
-    int base = ClampRegisterBase(g_selectedRegister);
-    if (target == 0) {
-        g_config.worldMatrixRegister = base;
-    } else if (target == 1) {
-        g_config.viewMatrixRegister = base;
-    } else if (target == 2) {
-        g_config.projMatrixRegister = base;
+
+    if (!g_freecamHasState && g_cameraMatrices.hasView) {
+        InitializeFreecamFromView(g_cameraMatrices.view);
     }
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    if (!g_freecamTimeInitialized) {
+        g_freecamLastCounter = now;
+        g_freecamTimeInitialized = true;
+    }
+
+    double deltaSeconds = 0.0;
+    if (g_perfFrequency.QuadPart > 0) {
+        deltaSeconds = static_cast<double>(now.QuadPart - g_freecamLastCounter.QuadPart) /
+                       static_cast<double>(g_perfFrequency.QuadPart);
+    }
+    g_freecamLastCounter = now;
+
+    float moveSpeed = 6.0f;
+    float lookSpeed = 0.0025f;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+        moveSpeed *= 2.5f;
+    }
+
+    if (hwnd) {
+        POINT pos = {};
+        if (GetCursorPos(&pos) && ScreenToClient(hwnd, &pos)) {
+            if (!g_freecamHasMouse) {
+                g_freecamLastMouse = pos;
+                g_freecamHasMouse = true;
+            }
+            ImGuiIO& io = ImGui::GetIO();
+            if (!io.WantCaptureMouse) {
+                int dx = pos.x - g_freecamLastMouse.x;
+                int dy = pos.y - g_freecamLastMouse.y;
+                g_freecamYaw += dx * lookSpeed;
+                g_freecamPitch += -dy * lookSpeed;
+                const float kPitchLimit = 1.55f;
+                if (g_freecamPitch > kPitchLimit) g_freecamPitch = kPitchLimit;
+                if (g_freecamPitch < -kPitchLimit) g_freecamPitch = -kPitchLimit;
+            }
+            g_freecamLastMouse = pos;
+        }
+    }
+
+    float cosPitch = cosf(g_freecamPitch);
+    float sinPitch = sinf(g_freecamPitch);
+    float cosYaw = cosf(g_freecamYaw);
+    float sinYaw = sinf(g_freecamYaw);
+    D3DVECTOR forward = {sinYaw * cosPitch, sinPitch, cosYaw * cosPitch};
+    forward = NormalizeVector(forward);
+    D3DVECTOR right = NormalizeVector(CrossVector({0.0f, 1.0f, 0.0f}, forward));
+    D3DVECTOR up = CrossVector(forward, right);
+
+    D3DVECTOR delta = {};
+    if (GetAsyncKeyState('W') & 0x8000) {
+        delta = AddVector(delta, forward);
+    }
+    if (GetAsyncKeyState('S') & 0x8000) {
+        delta = AddVector(delta, ScaleVector(forward, -1.0f));
+    }
+    if (GetAsyncKeyState('D') & 0x8000) {
+        delta = AddVector(delta, right);
+    }
+    if (GetAsyncKeyState('A') & 0x8000) {
+        delta = AddVector(delta, ScaleVector(right, -1.0f));
+    }
+    if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
+        delta = AddVector(delta, up);
+    }
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
+        delta = AddVector(delta, ScaleVector(up, -1.0f));
+    }
+
+    float deltaLen = sqrtf(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    if (deltaLen > 0.0001f && deltaSeconds > 0.0) {
+        delta = ScaleVector(delta, 1.0f / deltaLen);
+        g_freecamPosition = AddVector(g_freecamPosition, ScaleVector(delta, moveSpeed * static_cast<float>(deltaSeconds)));
+    }
+
+    D3DMATRIX view = BuildViewMatrixFromFreecam();
+    device->SetTransform(D3DTS_VIEW, &view);
+    StoreViewMatrix(view);
 }
 
 static void RenderImGuiOverlay() {
@@ -340,7 +509,13 @@ static void RenderImGuiOverlay() {
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
-    if (g_frameTimeSamples > 0) {
+    ImGui::Checkbox("Show FPS stats", &g_showFpsStats);
+    if (ImGui::Checkbox("Enable freecam (F6)", &g_freecamEnabled)) {
+        g_freecamHasState = false;
+        g_freecamTimeInitialized = false;
+        g_freecamHasMouse = false;
+    }
+    if (g_showFpsStats && g_frameTimeSamples > 0) {
         float minMs = g_frameTimeHistory[0];
         float maxMs = g_frameTimeHistory[0];
         double sumMs = 0.0;
@@ -367,94 +542,23 @@ static void RenderImGuiOverlay() {
     ImGui::Separator();
 
     if (!g_showConstantsView) {
-        int worldRegister = g_config.worldMatrixRegister;
-        int viewRegister = g_config.viewMatrixRegister;
-        int projRegister = g_config.projMatrixRegister;
-
-        ImGui::InputInt("World base register", &worldRegister, 4, 16);
-        ImGui::InputInt("View base register", &viewRegister, 4, 16);
-        ImGui::InputInt("Projection base register", &projRegister, 4, 16);
-
-        g_config.worldMatrixRegister = ClampRegisterBase(worldRegister);
-        g_config.viewMatrixRegister = ClampRegisterBase(viewRegister);
-        g_config.projMatrixRegister = ClampRegisterBase(projRegister);
-
-        D3DMATRIX mat = {};
-        char label[64];
-
-        if (g_config.worldMatrixRegister >= 0) {
-            snprintf(label, sizeof(label), "World (c%d-c%d)",
-                     g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
-        } else {
-            snprintf(label, sizeof(label), "World (disabled)");
-        }
-        bool hasWorld = TryBuildMatrixFromSnapshot(g_config.worldMatrixRegister, &mat);
-        DrawMatrix(label, mat, hasWorld);
-        ImGui::Separator();
-
-        if (g_config.viewMatrixRegister >= 0) {
-            snprintf(label, sizeof(label), "View (c%d-c%d)",
-                     g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
-        } else {
-            snprintf(label, sizeof(label), "View (disabled)");
-        }
-        bool hasView = TryBuildMatrixFromSnapshot(g_config.viewMatrixRegister, &mat);
-        DrawMatrix(label, mat, hasView);
-        ImGui::Separator();
-
-        if (g_config.projMatrixRegister >= 0) {
-            snprintf(label, sizeof(label), "Projection (c%d-c%d)",
-                     g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
-        } else {
-            snprintf(label, sizeof(label), "Projection (disabled)");
-        }
-        bool hasProj = TryBuildMatrixFromSnapshot(g_config.projMatrixRegister, &mat);
-        DrawMatrix(label, mat, hasProj);
-        ImGui::Separator();
-
-        DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
-
-        if (ImGui::CollapsingHeader("Captured Matrices", ImGuiTreeNodeFlags_DefaultOpen)) {
-            DrawMatrix("Captured World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
+        if (ImGui::CollapsingHeader("Camera Matrices", ImGuiTreeNodeFlags_DefaultOpen)) {
+            DrawMatrix("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
             ImGui::Separator();
-            DrawMatrix("Captured View", g_cameraMatrices.view, g_cameraMatrices.hasView);
+            DrawMatrix("View", g_cameraMatrices.view, g_cameraMatrices.hasView);
             ImGui::Separator();
-            DrawMatrix("Captured Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
+            DrawMatrix("Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
             ImGui::Separator();
-            DrawMatrix("Captured MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
+            DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
         }
-
     } else {
-        ImGui::Text("Snapshot updates every 60 frames.");
-        ImGui::Text("Select a register, then press W/V/P or click buttons.");
+        ImGui::Text("Snapshot updates every frame.");
         ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
         ImGui::SameLine();
         ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
         if (g_selectedRegister >= 0) {
             ImGui::Text("Selected register: c%d", g_selectedRegister);
         }
-        if (ImGui::Button("Set World (W)")) {
-            AssignSelectedRegister(0);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Set View (V)")) {
-            AssignSelectedRegister(1);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Set Projection (P)")) {
-            AssignSelectedRegister(2);
-        }
-
-        if (ImGui::IsKeyPressed(ImGuiKey_W)) {
-            AssignSelectedRegister(0);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_V)) {
-            AssignSelectedRegister(1);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_P)) {
-            AssignSelectedRegister(2);
-        }
-
         ImGui::BeginChild("ConstantsScroll", ImVec2(0, 340), true);
         if (g_vertexConstantsSnapshotReady) {
             if (g_showConstantsAsMatrices) {
@@ -772,9 +876,8 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    // Set both transforms for the runtime
+                    // Set view transform for the runtime
                     m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
-                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
 
@@ -803,7 +906,6 @@ public:
                     if (LooksLikeProjection(mat)) {
                         float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
                         LogMsg("AUTO-DETECT: PROJECTION matrix at c%d (FOV: %.1f deg)", reg, fov);
-                        m_real->SetTransform(D3DTS_PROJECTION, &mat);
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
                         StoreProjectionMatrix(m_lastProjMatrix);
@@ -857,7 +959,6 @@ public:
                 if (LooksLikeProjection(mat)) {
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
-                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
@@ -895,9 +996,7 @@ public:
         if (g_config.logAllConstants) {
             m_constantLogThrottle = (m_constantLogThrottle + 1) % 60;
         }
-        if (g_frameCount % 60 == 0 || !g_vertexConstantsSnapshotReady) {
-            UpdateConstantSnapshot();
-        }
+        UpdateConstantSnapshot();
 
         // Log periodic status
         if (g_frameCount % 300 == 0) {
@@ -909,6 +1008,8 @@ public:
         }
         UpdateImGuiToggle();
         UpdatePauseToggle();
+        UpdateFreecamToggle();
+        UpdateFreecam(m_real, m_hwnd);
         RenderImGuiOverlay();
 
         if (g_pauseRendering) {

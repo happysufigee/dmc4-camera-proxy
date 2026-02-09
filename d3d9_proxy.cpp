@@ -30,6 +30,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              WPARAM wParam,
                                                              LPARAM lParam);
 
+bool LooksLikeMatrix(const float* data);
+
 #pragma comment(lib, "user32.lib")
 
 // Configuration
@@ -71,6 +73,8 @@ static bool g_pauseRendering = false;
 static bool g_pauseToggleWasDown = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsView = false;
+static bool g_showConstantsAsMatrices = true;
+static bool g_filterDetectedMatrices = false;
 
 static constexpr int kMaxConstantRegisters = 256;
 static float g_vertexConstants[kMaxConstantRegisters][4] = {};
@@ -231,6 +235,19 @@ static bool TryBuildMatrixFromSnapshot(int baseRegister, D3DMATRIX* outMatrix) {
     outMatrix->_42 = g_vertexConstantsSnapshot[baseRegister + 3][1];
     outMatrix->_43 = g_vertexConstantsSnapshot[baseRegister + 3][2];
     outMatrix->_44 = g_vertexConstantsSnapshot[baseRegister + 3][3];
+    return true;
+}
+
+static bool TryBuildMatrixSnapshotInfo(int baseRegister, D3DMATRIX* outMatrix, bool* looksLike) {
+    if (!TryBuildMatrixFromSnapshot(baseRegister, outMatrix)) {
+        if (looksLike) {
+            *looksLike = false;
+        }
+        return false;
+    }
+    if (looksLike) {
+        *looksLike = LooksLikeMatrix(reinterpret_cast<const float*>(outMatrix));
+    }
     return true;
 }
 
@@ -410,6 +427,9 @@ static void RenderImGuiOverlay() {
     } else {
         ImGui::Text("Snapshot updates every 60 frames.");
         ImGui::Text("Select a register, then press W/V/P or click buttons.");
+        ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
+        ImGui::SameLine();
+        ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
         if (g_selectedRegister >= 0) {
             ImGui::Text("Selected register: c%d", g_selectedRegister);
         }
@@ -435,35 +455,74 @@ static void RenderImGuiOverlay() {
             AssignSelectedRegister(2);
         }
 
-        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 360), true);
+        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 340), true);
         if (g_vertexConstantsSnapshotReady) {
-            int i = 0;
-            while (i < kMaxConstantRegisters) {
-                if (!g_vertexConstantsSnapshotValid[i]) {
-                    i++;
-                    continue;
-                }
-                int start = i;
-                int end = i;
-                while (end + 1 < kMaxConstantRegisters &&
-                       g_vertexConstantsSnapshotValid[end + 1]) {
-                    end++;
-                }
+            if (g_showConstantsAsMatrices) {
+                for (int base = 0; base < kMaxConstantRegisters; base += 4) {
+                    D3DMATRIX mat = {};
+                    bool looksLike = false;
+                    bool hasMatrix = TryBuildMatrixSnapshotInfo(base, &mat, &looksLike);
 
-                char rangeLabel[64];
-                snprintf(rangeLabel, sizeof(rangeLabel), "c%d-c%d", start, end);
-                if (ImGui::CollapsingHeader(rangeLabel)) {
-                    for (int reg = start; reg <= end; reg++) {
-                        const float* data = g_vertexConstantsSnapshot[reg];
-                        char rowLabel[128];
-                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
-                                 reg, data[0], data[1], data[2], data[3]);
-                        if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
-                            g_selectedRegister = reg;
+                    if (g_filterDetectedMatrices) {
+                        if (!hasMatrix || !looksLike) {
+                            continue;
+                        }
+                    } else {
+                        bool anyValid = false;
+                        for (int reg = base; reg < base + 4; reg++) {
+                            if (g_vertexConstantsSnapshotValid[reg]) {
+                                anyValid = true;
+                                break;
+                            }
+                        }
+                        if (!anyValid) {
+                            continue;
                         }
                     }
+
+                    char label[64];
+                    snprintf(label, sizeof(label), "c%d-c%d%s", base, base + 3,
+                             looksLike ? " (matrix)" : "");
+                    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                                               ImGuiTreeNodeFlags_SpanAvailWidth;
+                    if (g_selectedRegister == base) {
+                        flags |= ImGuiTreeNodeFlags_Selected;
+                    }
+                    bool open = ImGui::TreeNodeEx(label, flags);
+                    if (ImGui::IsItemClicked()) {
+                        g_selectedRegister = base;
+                    }
+                    if (open) {
+                        for (int reg = base; reg < base + 4; reg++) {
+                            char rowLabel[128];
+                            if (g_vertexConstantsSnapshotValid[reg]) {
+                                const float* data = g_vertexConstantsSnapshot[reg];
+                                snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
+                                         reg, data[0], data[1], data[2], data[3]);
+                            } else {
+                                snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>", reg);
+                            }
+                            bool selected = (g_selectedRegister == reg);
+                            if (ImGui::Selectable(rowLabel, selected)) {
+                                g_selectedRegister = reg;
+                            }
+                        }
+                        ImGui::TreePop();
+                    }
                 }
-                i = end + 1;
+            } else {
+                for (int reg = 0; reg < kMaxConstantRegisters; reg++) {
+                    if (!g_vertexConstantsSnapshotValid[reg]) {
+                        continue;
+                    }
+                    const float* data = g_vertexConstantsSnapshot[reg];
+                    char rowLabel[128];
+                    snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
+                             reg, data[0], data[1], data[2], data[3]);
+                    if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                        g_selectedRegister = reg;
+                    }
+                }
             }
         } else {
             ImGui::Text("<no constants captured yet>");
@@ -695,33 +754,39 @@ public:
             memcpy(&mvp, pConstantData, sizeof(D3DMATRIX));
             StoreMVPMatrix(mvp);
 
-            // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
-            bool validFloats = true;
-            for (int i = 0; i < 16 && validFloats; i++) {
-                if (!std::isfinite(pConstantData[i])) validFloats = false;
-            }
+            bool allowMvpExtraction = g_config.autoDetectMatrices ||
+                                      (g_config.viewMatrixRegister < 0 &&
+                                       g_config.projMatrixRegister < 0);
 
-            if (validFloats) {
-                // Extract approximate View from MVP
-                ExtractCameraFromMVP(mvp, &m_lastViewMatrix);
+            if (allowMvpExtraction) {
+                // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
+                bool validFloats = true;
+                for (int i = 0; i < 16 && validFloats; i++) {
+                    if (!std::isfinite(pConstantData[i])) validFloats = false;
+                }
 
-                // Create standard projection (60 degree FOV, 16:9 aspect)
-                CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
+                if (validFloats) {
+                    // Extract approximate View from MVP
+                    ExtractCameraFromMVP(mvp, &m_lastViewMatrix);
 
-                // Set both transforms for the runtime
-                m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
-                m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
-                StoreViewMatrix(m_lastViewMatrix);
-                StoreProjectionMatrix(m_lastProjMatrix);
+                    // Create standard projection (60 degree FOV, 16:9 aspect)
+                    CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                if (!m_hasView) {
-                    LogMsg("DMC4: Extracting camera from MVP at c0-c3");
-                    LogMsg("  MVP row0: [%.3f, %.3f, %.3f, %.3f]", mvp._11, mvp._12, mvp._13, mvp._14);
-                    LogMsg("  MVP row1: [%.3f, %.3f, %.3f, %.3f]", mvp._21, mvp._22, mvp._23, mvp._24);
-                    LogMsg("  MVP row2: [%.3f, %.3f, %.3f, %.3f]", mvp._31, mvp._32, mvp._33, mvp._34);
-                    LogMsg("  MVP row3: [%.3f, %.3f, %.3f, %.3f]", mvp._41, mvp._42, mvp._43, mvp._44);
-                    m_hasView = true;
-                    m_hasProj = true;
+                    // Set both transforms for the runtime
+                    m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+                    StoreViewMatrix(m_lastViewMatrix);
+                    StoreProjectionMatrix(m_lastProjMatrix);
+
+                    if (!m_hasView) {
+                        LogMsg("DMC4: Extracting camera from MVP at c0-c3");
+                        LogMsg("  MVP row0: [%.3f, %.3f, %.3f, %.3f]", mvp._11, mvp._12, mvp._13, mvp._14);
+                        LogMsg("  MVP row1: [%.3f, %.3f, %.3f, %.3f]", mvp._21, mvp._22, mvp._23, mvp._24);
+                        LogMsg("  MVP row2: [%.3f, %.3f, %.3f, %.3f]", mvp._31, mvp._32, mvp._33, mvp._34);
+                        LogMsg("  MVP row3: [%.3f, %.3f, %.3f, %.3f]", mvp._41, mvp._42, mvp._43, mvp._44);
+                        m_hasView = true;
+                        m_hasProj = true;
+                    }
                 }
             }
         }

@@ -75,6 +75,7 @@ static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsView = false;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
+static bool g_showFpsStats = true;
 
 static constexpr int kMaxConstantRegisters = 256;
 static float g_vertexConstants[kMaxConstantRegisters][4] = {};
@@ -340,7 +341,8 @@ static void RenderImGuiOverlay() {
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
-    if (g_frameTimeSamples > 0) {
+    ImGui::Checkbox("Show FPS stats", &g_showFpsStats);
+    if (g_showFpsStats && g_frameTimeSamples > 0) {
         float minMs = g_frameTimeHistory[0];
         float maxMs = g_frameTimeHistory[0];
         double sumMs = 0.0;
@@ -425,7 +427,7 @@ static void RenderImGuiOverlay() {
         }
 
     } else {
-        ImGui::Text("Snapshot updates every 60 frames.");
+        ImGui::Text("Snapshot updates every frame.");
         ImGui::Text("Select a register, then press W/V/P or click buttons.");
         ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
         ImGui::SameLine();
@@ -772,9 +774,8 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    // Set both transforms for the runtime
+                    // Set view transform for the runtime
                     m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
-                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
 
@@ -803,7 +804,6 @@ public:
                     if (LooksLikeProjection(mat)) {
                         float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
                         LogMsg("AUTO-DETECT: PROJECTION matrix at c%d (FOV: %.1f deg)", reg, fov);
-                        m_real->SetTransform(D3DTS_PROJECTION, &mat);
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
                         StoreProjectionMatrix(m_lastProjMatrix);
@@ -857,7 +857,6 @@ public:
                 if (LooksLikeProjection(mat)) {
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
-                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
@@ -895,9 +894,7 @@ public:
         if (g_config.logAllConstants) {
             m_constantLogThrottle = (m_constantLogThrottle + 1) % 60;
         }
-        if (g_frameCount % 60 == 0 || !g_vertexConstantsSnapshotReady) {
-            UpdateConstantSnapshot();
-        }
+        UpdateConstantSnapshot();
 
         // Log periodic status
         if (g_frameCount % 300 == 0) {

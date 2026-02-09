@@ -60,10 +60,12 @@ struct CameraMatrices {
 static CameraMatrices g_cameraMatrices = {};
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
-static bool g_showImGui = true;
+static bool g_showImGui = false;
 static bool g_toggleWasDown = false;
 static bool g_pauseRendering = false;
 static bool g_pauseToggleWasDown = false;
+static WNDPROC g_imguiPrevWndProc = nullptr;
+static bool g_showConstantsView = false;
 
 static constexpr int kMaxConstantRegisters = 256;
 static float g_vertexConstants[kMaxConstantRegisters][4] = {};
@@ -84,6 +86,16 @@ static unsigned long long g_frameTimeSamples = 0;
 static LARGE_INTEGER g_perfFrequency = {};
 static LARGE_INTEGER g_prevCounter = {};
 static bool g_perfInitialized = false;
+
+static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_imguiInitialized) {
+        ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+    }
+    if (g_imguiPrevWndProc) {
+        return CallWindowProc(g_imguiPrevWndProc, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
 
 static void StoreViewMatrix(const D3DMATRIX& view) {
     g_cameraMatrices.view = view;
@@ -131,11 +143,15 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX9_Init(device);
     g_imguiInitialized = true;
     g_imguiHwnd = hwnd;
+    g_imguiPrevWndProc =
+        reinterpret_cast<WNDPROC>(SetWindowLongPtr(hwnd, GWLP_WNDPROC,
+                                                   reinterpret_cast<LONG_PTR>(ImGuiWndProcHook)));
 }
 
 static void ShutdownImGui() {
@@ -147,6 +163,10 @@ static void ShutdownImGui() {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_imguiInitialized = false;
+    if (g_imguiPrevWndProc && g_imguiHwnd) {
+        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
+    }
+    g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
 }
 
@@ -293,152 +313,157 @@ static void RenderImGuiOverlay() {
     ImGui::NewFrame();
 
     ImGui::SetNextWindowBgAlpha(0.7f);
+    ImGui::SetNextWindowSize(ImVec2(640, 520), ImGuiCond_FirstUseEver);
     ImGui::Begin("Camera Matrices", nullptr,
-                 ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
     if (g_frameTimeSamples > 0) {
-        float avgMs = static_cast<float>(g_frameTimeSum / static_cast<double>(g_frameTimeSamples));
+        float minMs = g_frameTimeHistory[0];
+        float maxMs = g_frameTimeHistory[0];
+        double sumMs = 0.0;
+        for (int i = 0; i < g_frameTimeCount; i++) {
+            float ms = g_frameTimeHistory[i];
+            if (ms < minMs) minMs = ms;
+            if (ms > maxMs) maxMs = ms;
+            sumMs += ms;
+        }
+        float avgMs = g_frameTimeCount > 0 ? static_cast<float>(sumMs / g_frameTimeCount) : 0.0f;
         float avgFps = avgMs > 0.0f ? 1000.0f / avgMs : 0.0f;
-        float minFps = g_frameTimeMax > 0.0f ? 1000.0f / g_frameTimeMax : 0.0f;
-        float maxFps = g_frameTimeMin > 0.0f ? 1000.0f / g_frameTimeMin : 0.0f;
+        float minFps = maxMs > 0.0f ? 1000.0f / maxMs : 0.0f;
+        float maxFps = minMs > 0.0f ? 1000.0f / minMs : 0.0f;
         ImGui::Text("FPS avg/min/max: %.1f / %.1f / %.1f", avgFps, minFps, maxFps);
         ImGui::Text("Frame time ms avg/min/max: %.2f / %.2f / %.2f",
-                    avgMs, g_frameTimeMin, g_frameTimeMax);
+                    avgMs, minMs, maxMs);
         ImGui::PlotLines("Frame time (ms)", g_frameTimeHistory, g_frameTimeCount, g_frameTimeIndex,
-                         nullptr, 0.0f, g_frameTimeMax > 0.0f ? g_frameTimeMax : 33.0f,
+                         nullptr, 0.0f, maxMs > 0.0f ? maxMs : 33.0f,
                          ImVec2(0, 80));
     }
 
-    if (ImGui::BeginTabBar("CameraTabs")) {
-        if (ImGui::BeginTabItem("Matrices")) {
-            int worldRegister = g_config.worldMatrixRegister;
-            int viewRegister = g_config.viewMatrixRegister;
-            int projRegister = g_config.projMatrixRegister;
+    ImGui::Separator();
+    ImGui::Checkbox("Show all constant registers", &g_showConstantsView);
+    ImGui::Separator();
 
-            ImGui::InputInt("World base register", &worldRegister, 4, 16);
-            ImGui::InputInt("View base register", &viewRegister, 4, 16);
-            ImGui::InputInt("Projection base register", &projRegister, 4, 16);
+    if (!g_showConstantsView) {
+        int worldRegister = g_config.worldMatrixRegister;
+        int viewRegister = g_config.viewMatrixRegister;
+        int projRegister = g_config.projMatrixRegister;
 
-            g_config.worldMatrixRegister = ClampRegisterBase(worldRegister);
-            g_config.viewMatrixRegister = ClampRegisterBase(viewRegister);
-            g_config.projMatrixRegister = ClampRegisterBase(projRegister);
+        ImGui::InputInt("World base register", &worldRegister, 4, 16);
+        ImGui::InputInt("View base register", &viewRegister, 4, 16);
+        ImGui::InputInt("Projection base register", &projRegister, 4, 16);
 
-            D3DMATRIX mat = {};
-            char label[64];
+        g_config.worldMatrixRegister = ClampRegisterBase(worldRegister);
+        g_config.viewMatrixRegister = ClampRegisterBase(viewRegister);
+        g_config.projMatrixRegister = ClampRegisterBase(projRegister);
 
-            if (g_config.worldMatrixRegister >= 0) {
-                snprintf(label, sizeof(label), "World (c%d-c%d)",
-                         g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
-            } else {
-                snprintf(label, sizeof(label), "World (disabled)");
-            }
-            bool hasWorld = TryBuildMatrixFromSnapshot(g_config.worldMatrixRegister, &mat);
-            DrawMatrix(label, mat, hasWorld);
+        D3DMATRIX mat = {};
+        char label[64];
+
+        if (g_config.worldMatrixRegister >= 0) {
+            snprintf(label, sizeof(label), "World (c%d-c%d)",
+                     g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
+        } else {
+            snprintf(label, sizeof(label), "World (disabled)");
+        }
+        bool hasWorld = TryBuildMatrixFromSnapshot(g_config.worldMatrixRegister, &mat);
+        DrawMatrix(label, mat, hasWorld);
+        ImGui::Separator();
+
+        if (g_config.viewMatrixRegister >= 0) {
+            snprintf(label, sizeof(label), "View (c%d-c%d)",
+                     g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
+        } else {
+            snprintf(label, sizeof(label), "View (disabled)");
+        }
+        bool hasView = TryBuildMatrixFromSnapshot(g_config.viewMatrixRegister, &mat);
+        DrawMatrix(label, mat, hasView);
+        ImGui::Separator();
+
+        if (g_config.projMatrixRegister >= 0) {
+            snprintf(label, sizeof(label), "Projection (c%d-c%d)",
+                     g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
+        } else {
+            snprintf(label, sizeof(label), "Projection (disabled)");
+        }
+        bool hasProj = TryBuildMatrixFromSnapshot(g_config.projMatrixRegister, &mat);
+        DrawMatrix(label, mat, hasProj);
+        ImGui::Separator();
+
+        DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
+
+        if (ImGui::CollapsingHeader("Captured Matrices", ImGuiTreeNodeFlags_DefaultOpen)) {
+            DrawMatrix("Captured World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
             ImGui::Separator();
-
-            if (g_config.viewMatrixRegister >= 0) {
-                snprintf(label, sizeof(label), "View (c%d-c%d)",
-                         g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
-            } else {
-                snprintf(label, sizeof(label), "View (disabled)");
-            }
-            bool hasView = TryBuildMatrixFromSnapshot(g_config.viewMatrixRegister, &mat);
-            DrawMatrix(label, mat, hasView);
+            DrawMatrix("Captured View", g_cameraMatrices.view, g_cameraMatrices.hasView);
             ImGui::Separator();
-
-            if (g_config.projMatrixRegister >= 0) {
-                snprintf(label, sizeof(label), "Projection (c%d-c%d)",
-                         g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
-            } else {
-                snprintf(label, sizeof(label), "Projection (disabled)");
-            }
-            bool hasProj = TryBuildMatrixFromSnapshot(g_config.projMatrixRegister, &mat);
-            DrawMatrix(label, mat, hasProj);
+            DrawMatrix("Captured Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
             ImGui::Separator();
-
-            DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
-
-            if (ImGui::CollapsingHeader("Captured Matrices", ImGuiTreeNodeFlags_DefaultOpen)) {
-                DrawMatrix("Captured World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
-                ImGui::Separator();
-                DrawMatrix("Captured View", g_cameraMatrices.view, g_cameraMatrices.hasView);
-                ImGui::Separator();
-                DrawMatrix("Captured Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
-                ImGui::Separator();
-                DrawMatrix("Captured MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
-            }
-
-            ImGui::EndTabItem();
+            DrawMatrix("Captured MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
         }
 
-        if (ImGui::BeginTabItem("All constant registers")) {
-            ImGui::Text("Snapshot updates every 60 frames.");
-            ImGui::Text("Select a register, then press W/V/P or click buttons.");
-            if (g_selectedRegister >= 0) {
-                ImGui::Text("Selected register: c%d", g_selectedRegister);
-            }
-            if (ImGui::Button("Set World (W)")) {
-                AssignSelectedRegister(0);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Set View (V)")) {
-                AssignSelectedRegister(1);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Set Projection (P)")) {
-                AssignSelectedRegister(2);
-            }
+    } else {
+        ImGui::Text("Snapshot updates every 60 frames.");
+        ImGui::Text("Select a register, then press W/V/P or click buttons.");
+        if (g_selectedRegister >= 0) {
+            ImGui::Text("Selected register: c%d", g_selectedRegister);
+        }
+        if (ImGui::Button("Set World (W)")) {
+            AssignSelectedRegister(0);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Set View (V)")) {
+            AssignSelectedRegister(1);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Set Projection (P)")) {
+            AssignSelectedRegister(2);
+        }
 
-            if (ImGui::IsKeyPressed(ImGuiKey_W)) {
-                AssignSelectedRegister(0);
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_V)) {
-                AssignSelectedRegister(1);
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_P)) {
-                AssignSelectedRegister(2);
-            }
+        if (ImGui::IsKeyPressed(ImGuiKey_W)) {
+            AssignSelectedRegister(0);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_V)) {
+            AssignSelectedRegister(1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_P)) {
+            AssignSelectedRegister(2);
+        }
 
-            ImGui::BeginChild("ConstantsScroll", ImVec2(640, 360), true);
-            if (g_vertexConstantsSnapshotReady) {
-                int i = 0;
-                while (i < kMaxConstantRegisters) {
-                    if (!g_vertexConstantsSnapshotValid[i]) {
-                        i++;
-                        continue;
-                    }
-                    int start = i;
-                    int end = i;
-                    while (end + 1 < kMaxConstantRegisters &&
-                           g_vertexConstantsSnapshotValid[end + 1]) {
-                        end++;
-                    }
+        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 360), true);
+        if (g_vertexConstantsSnapshotReady) {
+            int i = 0;
+            while (i < kMaxConstantRegisters) {
+                if (!g_vertexConstantsSnapshotValid[i]) {
+                    i++;
+                    continue;
+                }
+                int start = i;
+                int end = i;
+                while (end + 1 < kMaxConstantRegisters &&
+                       g_vertexConstantsSnapshotValid[end + 1]) {
+                    end++;
+                }
 
-                    char rangeLabel[64];
-                    snprintf(rangeLabel, sizeof(rangeLabel), "c%d-c%d", start, end);
-                    if (ImGui::CollapsingHeader(rangeLabel)) {
-                        for (int reg = start; reg <= end; reg++) {
-                            const float* data = g_vertexConstantsSnapshot[reg];
-                            char rowLabel[128];
-                            snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
-                                     reg, data[0], data[1], data[2], data[3]);
-                            if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
-                                g_selectedRegister = reg;
-                            }
+                char rangeLabel[64];
+                snprintf(rangeLabel, sizeof(rangeLabel), "c%d-c%d", start, end);
+                if (ImGui::CollapsingHeader(rangeLabel)) {
+                    for (int reg = start; reg <= end; reg++) {
+                        const float* data = g_vertexConstantsSnapshot[reg];
+                        char rowLabel[128];
+                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
+                                 reg, data[0], data[1], data[2], data[3]);
+                        if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                            g_selectedRegister = reg;
                         }
                     }
-                    i = end + 1;
                 }
-            } else {
-                ImGui::Text("<no constants captured yet>");
+                i = end + 1;
             }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
+        } else {
+            ImGui::Text("<no constants captured yet>");
         }
-
-        ImGui::EndTabBar();
+        ImGui::EndChild();
     }
 
     ImGui::End();

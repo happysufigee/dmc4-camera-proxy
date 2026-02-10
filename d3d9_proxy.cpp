@@ -1034,8 +1034,8 @@ static void RenderImGuiOverlay() {
         float graphMaxMs = (std::max)(33.0f, avgMs * 1.75f);
         ImGui::Text("FPS: %.1f", avgFps);
         ImGui::Text("ms: %.2f", avgMs);
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.10f, 0.70f, 0.20f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4(0.35f, 0.95f, 0.40f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.72f, 0.28f, 0.28f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4(0.86f, 0.40f, 0.40f, 1.00f));
         ImGui::PlotLines("Frame time (ms)", g_frameTimeHistory, g_frameTimeCount, g_frameTimeIndex,
                          nullptr, 0.0f, graphMaxMs,
                          ImVec2(0, 80));
@@ -1045,14 +1045,10 @@ static void RenderImGuiOverlay() {
     ImGui::Separator();
     ImGui::Text("Credits: ");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.15f, 0.65f, 0.15f, 1.0f), "Overseer");
+    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
     ImGui::SameLine();
     ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
-    ImGui::TextColored(ImVec4(0.15f, 0.65f, 0.15f, 1.0f), "modified by cobalticarus92");
-    ImVec2 min = ImGui::GetItemRectMin();
-    ImVec2 max = ImGui::GetItemRectMax();
-    ImGui::GetWindowDrawList()->AddLine(ImVec2(min.x, max.y), ImVec2(max.x, max.y),
-                                        ImGui::GetColorU32(ImVec4(0.15f, 0.65f, 0.15f, 1.0f)), 1.0f);
+    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "modified by cobalticarus92");
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {

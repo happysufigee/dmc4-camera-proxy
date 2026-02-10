@@ -1,6 +1,6 @@
-# DMC4 Camera Proxy for RTX Remix
+# Camera Proxy for RTX Remix
 
-A D3D9 proxy DLL that intercepts Direct3D 9 calls from Devil May Cry 4, extracts camera matrices from vertex shader constants, and provides them to RTX Remix via `SetTransform()`.
+(copied over from mencelot/dmc4-camera-proxy)A D3D9 proxy DLL that intercepts Direct3D 9 calls from Devil May Cry 4, extracts camera matrices from vertex shader constants, and provides them to RTX Remix via `SetTransform()`.
 
 DMC4 uses a fully programmable shader pipeline and never calls the fixed-function `SetTransform()` API that Remix relies on for camera information. This proxy sits between the game and Remix's `d3d9.dll`, intercepts `SetVertexShaderConstantF` calls, identifies the MVP matrix at shader registers `c0-c3`, and forwards the extracted view/projection matrices to Remix.
 

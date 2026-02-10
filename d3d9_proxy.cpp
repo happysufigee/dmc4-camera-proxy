@@ -87,7 +87,42 @@ struct CameraMatrices {
     bool hasMVP;
 };
 
+enum MatrixSlot {
+    MatrixSlot_World = 0,
+    MatrixSlot_View = 1,
+    MatrixSlot_Projection = 2,
+    MatrixSlot_MVP = 3,
+    MatrixSlot_Count = 4
+};
+
+
+struct ManualMatrixBinding {
+    bool enabled = false;
+    uintptr_t shaderKey = 0;
+    int baseRegister = -1;
+    int rows = 4;
+};
+
+struct MatrixSourceInfo {
+    bool valid = false;
+    bool manual = false;
+    uintptr_t shaderKey = 0;
+    uint32_t shaderHash = 0;
+    int baseRegister = -1;
+    int rows = 4;
+    bool transposed = false;
+};
+
 static CameraMatrices g_cameraMatrices = {};
+static MatrixSourceInfo g_matrixSources[MatrixSlot_Count] = {};
+static ManualMatrixBinding g_manualBindings[MatrixSlot_Count] = {};
+static void UpdateMatrixSource(MatrixSlot slot,
+                               uintptr_t shaderKey,
+                               int baseRegister,
+                               int rows,
+                               bool transposed,
+                               bool manual);
+
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
@@ -102,6 +137,12 @@ static bool g_showTransposedMatrices = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
 static char g_manualEmitStatus[192] = "";
+static char g_matrixAssignStatus[256] = "";
+static int g_manualAssignRows = 4;
+
+static int g_iniViewMatrixRegister = 4;
+static int g_iniProjMatrixRegister = 8;
+static int g_iniWorldMatrixRegister = 0;
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -190,24 +231,48 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static void StoreViewMatrix(const D3DMATRIX& view) {
+static void StoreViewMatrix(const D3DMATRIX& view,
+                            uintptr_t shaderKey = 0,
+                            int baseRegister = -1,
+                            int rows = 4,
+                            bool transposed = false,
+                            bool manual = false) {
     g_cameraMatrices.view = view;
     g_cameraMatrices.hasView = true;
+    UpdateMatrixSource(MatrixSlot_View, shaderKey, baseRegister, rows, transposed, manual);
 }
 
-static void StoreProjectionMatrix(const D3DMATRIX& projection) {
+static void StoreProjectionMatrix(const D3DMATRIX& projection,
+                                  uintptr_t shaderKey = 0,
+                                  int baseRegister = -1,
+                                  int rows = 4,
+                                  bool transposed = false,
+                                  bool manual = false) {
     g_cameraMatrices.projection = projection;
     g_cameraMatrices.hasProjection = true;
+    UpdateMatrixSource(MatrixSlot_Projection, shaderKey, baseRegister, rows, transposed, manual);
 }
 
-static void StoreWorldMatrix(const D3DMATRIX& world) {
+static void StoreWorldMatrix(const D3DMATRIX& world,
+                             uintptr_t shaderKey = 0,
+                             int baseRegister = -1,
+                             int rows = 4,
+                             bool transposed = false,
+                             bool manual = false) {
     g_cameraMatrices.world = world;
     g_cameraMatrices.hasWorld = true;
+    UpdateMatrixSource(MatrixSlot_World, shaderKey, baseRegister, rows, transposed, manual);
 }
 
-static void StoreMVPMatrix(const D3DMATRIX& mvp) {
+static void StoreMVPMatrix(const D3DMATRIX& mvp,
+                           uintptr_t shaderKey = 0,
+                           int baseRegister = -1,
+                           int rows = 4,
+                           bool transposed = false,
+                           bool manual = false) {
     g_cameraMatrices.mvp = mvp;
     g_cameraMatrices.hasMVP = true;
+    UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual);
 }
 
 static HMODULE LoadSystemD3D9() {
@@ -326,6 +391,127 @@ static uint32_t HashBytesFNV1a(const uint8_t* data, size_t size) {
 
 static uint32_t HashMatrix(const D3DMATRIX& mat) {
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&mat), sizeof(D3DMATRIX));
+}
+
+static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
+    auto it = g_shaderBytecodeHashes.find(shaderKey);
+    if (it != g_shaderBytecodeHashes.end()) {
+        return it->second;
+    }
+    return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
+}
+
+static void UpdateMatrixSource(MatrixSlot slot,
+                               uintptr_t shaderKey,
+                               int baseRegister,
+                               int rows,
+                               bool transposed,
+                               bool manual) {
+    MatrixSourceInfo info = {};
+    info.valid = true;
+    info.manual = manual;
+    info.shaderKey = shaderKey;
+    info.shaderHash = GetShaderHashForKey(shaderKey);
+    info.baseRegister = baseRegister;
+    info.rows = rows;
+    info.transposed = transposed;
+    g_matrixSources[slot] = info;
+}
+
+static void DrawMatrixSourceInfo(MatrixSlot slot, const D3DMATRIX& mat, bool available) {
+    if (!available) {
+        return;
+    }
+
+    const MatrixSourceInfo& source = g_matrixSources[slot];
+    ImGui::Text("Matrix hash: 0x%08X", HashMatrix(mat));
+    if (!source.valid) {
+        ImGui::Text("Source: <unknown>");
+        return;
+    }
+
+    ImGui::Text("Source shader: 0x%p (hash 0x%08X)", reinterpret_cast<void*>(source.shaderKey), source.shaderHash);
+    if (source.baseRegister >= 0) {
+        ImGui::Text("Registers: c%d-c%d (%d rows)%s",
+                    source.baseRegister,
+                    source.baseRegister + (source.rows - 1),
+                    source.rows,
+                    source.transposed ? " [transposed]" : "");
+    }
+    ImGui::Text("Origin: %s", source.manual ? "manual constants selection" : "auto/config detection");
+}
+
+
+
+static bool CanAssignManualMatrix(MatrixSlot slot, char* reason, size_t reasonSize) {
+    if (g_config.autoDetectMatrices) {
+        snprintf(reason, reasonSize,
+                 "Manual assignment blocked: AutoDetectMatrices is enabled in camera_proxy.ini.");
+        return false;
+    }
+
+    if (slot == MatrixSlot_View && g_iniViewMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual VIEW assignment blocked: ViewMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_Projection && g_iniProjMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual PROJECTION assignment blocked: ProjMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_World && g_iniWorldMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual WORLD assignment blocked: WorldMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    return true;
+}
+
+static const char* MatrixSlotLabel(MatrixSlot slot) {
+    switch (slot) {
+        case MatrixSlot_World: return "WORLD";
+        case MatrixSlot_View: return "VIEW";
+        case MatrixSlot_Projection: return "PROJECTION";
+        case MatrixSlot_MVP: return "MVP";
+        default: return "UNKNOWN";
+    }
+}
+
+static void TryAssignManualMatrixFromSelection(MatrixSlot slot,
+                                               uintptr_t shaderKey,
+                                               int baseRegister,
+                                               int rows,
+                                               const D3DMATRIX& mat) {
+    if (rows < 3 || rows > 4) {
+        return;
+    }
+
+    char reason[256] = {};
+    if (!CanAssignManualMatrix(slot, reason, sizeof(reason))) {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus), "%s", reason);
+        return;
+    }
+
+    g_manualBindings[slot].enabled = true;
+    g_manualBindings[slot].shaderKey = shaderKey;
+    g_manualBindings[slot].baseRegister = baseRegister;
+    g_manualBindings[slot].rows = rows;
+
+    if (slot == MatrixSlot_World) {
+        StoreWorldMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_View) {
+        StoreViewMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_Projection) {
+        StoreProjectionMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_MVP) {
+        StoreMVPMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    }
+
+    snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+             "Assigned %s from shader 0x%p registers c%d-c%d (%d rows).",
+             MatrixSlotLabel(slot), reinterpret_cast<void*>(shaderKey), baseRegister,
+             baseRegister + rows - 1, rows);
 }
 
 static D3DMATRIX TransposeMatrix(const D3DMATRIX& mat) {
@@ -1053,15 +1239,19 @@ static void RenderImGuiOverlay() {
         if (ImGui::BeginTabItem("Camera")) {
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
                                     g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.world, g_cameraMatrices.hasWorld);
             ImGui::Separator();
             DrawMatrixWithTranspose("View", g_cameraMatrices.view, g_cameraMatrices.hasView,
                                     g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_View, g_cameraMatrices.view, g_cameraMatrices.hasView);
             ImGui::Separator();
             DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
                                     g_cameraMatrices.hasProjection, g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
             ImGui::Separator();
-            DrawMatrixWithTranspose("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
+            DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
             ImGui::EndTabItem();
         }
 
@@ -1106,6 +1296,14 @@ static void RenderImGuiOverlay() {
             ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
             ImGui::SameLine();
             ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
+            ImGui::Text("Manual matrix range");
+            ImGui::SameLine();
+            ImGui::RadioButton("4 registers", &g_manualAssignRows, 4);
+            ImGui::SameLine();
+            ImGui::RadioButton("3 registers", &g_manualAssignRows, 3);
+            if (g_matrixAssignStatus[0] != '\0') {
+                ImGui::TextWrapped("%s", g_matrixAssignStatus);
+            }
 
             ImGui::Separator();
             ImGui::Checkbox("Enable shader constant editing", &g_enableShaderEditing);
@@ -1218,6 +1416,42 @@ static void RenderImGuiOverlay() {
                                     g_selectedRegister = reg;
                                 }
                                 ImGui::PopID();
+                            }
+
+                            int selectedRows = g_manualAssignRows;
+                            if (selectedRows == 3 && !state->valid[base + 2]) {
+                                selectedRows = 4;
+                            }
+                            bool canAssign = state->valid[base] && state->valid[base + 1] && state->valid[base + 2] &&
+                                             (selectedRows == 3 || state->valid[base + 3]);
+                            if (canAssign) {
+                                D3DMATRIX assignedMat = {};
+                                if (!TryBuildMatrixSnapshot(*state, base, selectedRows, false, &assignedMat)) {
+                                    canAssign = false;
+                                }
+                                if (canAssign) {
+                                    ImGui::PushID(base);
+                                    if (ImGui::Button("Use as World")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_World, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Use as View")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_View, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Use as Projection")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_Projection, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Use as MVP")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_MVP, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    ImGui::PopID();
+                                }
                             }
                             ImGui::TreePop();
                         }
@@ -1746,6 +1980,35 @@ public:
         }
         state->snapshotReady = true;
 
+        if (shaderKey != 0) {
+            for (int slot = 0; slot < MatrixSlot_Count; slot++) {
+                const ManualMatrixBinding& binding = g_manualBindings[slot];
+                if (!binding.enabled || binding.shaderKey != shaderKey) {
+                    continue;
+                }
+                D3DMATRIX manualMat = {};
+                if (!TryBuildMatrixSnapshot(*state, binding.baseRegister, binding.rows, false, &manualMat)) {
+                    continue;
+                }
+                if (slot == MatrixSlot_World) {
+                    m_lastWorldMatrix = manualMat;
+                    m_hasWorld = true;
+                    StoreWorldMatrix(m_lastWorldMatrix, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_View) {
+                    m_lastViewMatrix = manualMat;
+                    m_hasView = true;
+                    StoreViewMatrix(m_lastViewMatrix, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_Projection) {
+                    m_lastProjMatrix = manualMat;
+                    m_hasProj = true;
+                    StoreProjectionMatrix(m_lastProjMatrix, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_MVP) {
+                    StoreMVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
+                }
+            }
+            EmitFixedFunctionTransforms();
+        }
+
         // Diagnostic logging mode - log ALL constant updates
         if (g_config.logAllConstants && m_constantLogThrottle == 0) {
             if (Vector4fCount >= 4) {
@@ -1767,7 +2030,7 @@ public:
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
             memcpy(&mvp, effectiveConstantData, sizeof(D3DMATRIX));
-            StoreMVPMatrix(mvp);
+            StoreMVPMatrix(mvp, shaderKey, 0, 4, false, false);
 
             bool allowMvpExtraction = g_config.autoDetectMatrices ||
                                       (g_config.viewMatrixRegister < 0 &&
@@ -1787,8 +2050,8 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    StoreViewMatrix(m_lastViewMatrix);
-                    StoreProjectionMatrix(m_lastProjMatrix);
+                    StoreViewMatrix(m_lastViewMatrix, shaderKey, 0, 4, false, false);
+                    StoreProjectionMatrix(m_lastProjMatrix, shaderKey, 0, 4, false, false);
                     EmitFixedFunctionTransforms();
 
                     if (!m_hasView) {
@@ -1820,7 +2083,7 @@ public:
                         LogMsg("AUTO-DETECT: PROJECTION matrix at c%d (FOV: %.1f deg)", reg, fov);
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
-                        StoreProjectionMatrix(m_lastProjMatrix);
+                        StoreProjectionMatrix(m_lastProjMatrix, shaderKey, static_cast<int>(reg), 4, false, false);
                         EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), false, projStrict);
                     }
@@ -1828,7 +2091,7 @@ public:
                         LogMsg("AUTO-DETECT: VIEW matrix at c%d", reg);
                         memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasView = true;
-                        StoreViewMatrix(m_lastViewMatrix);
+                        StoreViewMatrix(m_lastViewMatrix, shaderKey, static_cast<int>(reg), 4, false, false);
                         EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
                     }
@@ -1861,7 +2124,8 @@ public:
                 if (viewStrict || LooksLikeView(mat)) {
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
-                    StoreViewMatrix(m_lastViewMatrix);
+                    StoreViewMatrix(m_lastViewMatrix, shaderKey, g_config.viewMatrixRegister, configuredRows,
+                                    transposePass != 0, false);
                     EmitFixedFunctionTransforms();
                     LogMsg("Extracted VIEW matrix from c%d (rows=%d transpose=%d)",
                            g_config.viewMatrixRegister, configuredRows, transposePass != 0 ? 1 : 0);
@@ -1889,7 +2153,8 @@ public:
                 if (projStrict || projLike) {
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
-                    StoreProjectionMatrix(m_lastProjMatrix);
+                    StoreProjectionMatrix(m_lastProjMatrix, shaderKey, g_config.projMatrixRegister, configuredRows,
+                                          transposePass != 0, false);
                     EmitFixedFunctionTransforms();
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
@@ -1909,7 +2174,7 @@ public:
                                                  false, &mat) && LooksLikeMatrix(reinterpret_cast<const float*>(&mat))) {
                 memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
                 m_hasWorld = true;
-                StoreWorldMatrix(m_lastWorldMatrix);
+                StoreWorldMatrix(m_lastWorldMatrix, shaderKey, g_config.worldMatrixRegister, configuredRows, false, false);
                 EmitFixedFunctionTransforms();
             }
         }
@@ -2351,6 +2616,9 @@ void LoadConfig() {
     g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", 4, path);
     g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", 8, path);
     g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", 0, path);
+    g_iniViewMatrixRegister = g_config.viewMatrixRegister;
+    g_iniProjMatrixRegister = g_config.projMatrixRegister;
+    g_iniWorldMatrixRegister = g_config.worldMatrixRegister;
     g_config.enableLogging = GetPrivateProfileIntA("CameraProxy", "EnableLogging", 1, path) != 0;
     g_config.logAllConstants = GetPrivateProfileIntA("CameraProxy", "LogAllConstants", 0, path) != 0;
     g_config.autoDetectMatrices = GetPrivateProfileIntA("CameraProxy", "AutoDetectMatrices", 0, path) != 0;

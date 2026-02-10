@@ -1264,7 +1264,7 @@ static void RenderImGuiOverlay() {
                         ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
-                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[std::max(0, std::min(c.strategy, 4))]);
+                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[(std::max)(0, (std::min)(c.strategy, 4))]);
                         ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
                         ImGui::TableSetColumnIndex(5); ImGui::Text("%s", c.inverseView ? "yes" : "no");
                     }
@@ -1287,7 +1287,7 @@ static void RenderImGuiOverlay() {
                         ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
-                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[std::max(0, std::min(c.strategy, 4))]);
+                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[(std::max)(0, (std::min)(c.strategy, 4))]);
                         ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
                     }
                     ImGui::EndTable();
@@ -1296,9 +1296,6 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("Select a shader in Constants tab first.");
             }
             ImGui::EndTabItem();
-        }
-
-        ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("Memory Scanner")) {

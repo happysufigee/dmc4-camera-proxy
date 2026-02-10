@@ -1213,9 +1213,11 @@ static void RenderImGuiOverlay() {
                                     snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>", reg);
                                 }
                                 bool selected = (g_selectedRegister == reg);
+                                ImGui::PushID(reg);
                                 if (ImGui::Selectable(rowLabel, selected)) {
                                     g_selectedRegister = reg;
                                 }
+                                ImGui::PopID();
                             }
                             ImGui::TreePop();
                         }
@@ -1229,9 +1231,11 @@ static void RenderImGuiOverlay() {
                         char rowLabel[128];
                         snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
                                  reg, data[0], data[1], data[2], data[3]);
+                        ImGui::PushID(reg);
                         if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
                             g_selectedRegister = reg;
                         }
+                        ImGui::PopID();
                     }
                 }
             } else {

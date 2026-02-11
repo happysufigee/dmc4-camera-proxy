@@ -1,0 +1,29 @@
+# Build outputs
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Log files
+*.log
+build_log.txt
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*~

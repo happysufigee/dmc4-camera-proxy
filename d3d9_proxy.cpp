@@ -198,6 +198,8 @@ struct ShaderConstantState {
     unsigned long long lastChangeSerial = 0;
 };
 
+static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing);
+
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
 static std::unordered_map<uintptr_t, bool> g_disabledShaderZeroing = {};

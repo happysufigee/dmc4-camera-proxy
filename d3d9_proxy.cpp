@@ -1893,98 +1893,84 @@ static void RenderImGuiOverlay() {
             ImGui::Combo("Layout strategy", &g_layoutStrategyMode, kLayoutModes, IM_ARRAYSIZE(kLayoutModes));
             ImGui::Checkbox("Probe transposed layouts", &g_probeTransposedLayouts);
             ImGui::SameLine();
-            ImGui::Checkbox("Probe inverse-view", &g_probeInverseView);
-            ImGui::Checkbox("Auto-pick top candidates", &g_autoPickCandidates);
-            ImGui::InputInt("Stability frames", &g_config.stabilityFrames);
-            ImGui::InputFloat("Variance threshold", &g_config.varianceThreshold, 0.0005f, 0.001f, "%.6f");
-            ImGui::InputInt("Top candidate count", &g_config.topCandidateCount);
-            if (g_config.stabilityFrames < 1) g_config.stabilityFrames = 1;
-            if (g_config.topCandidateCount < 1) g_config.topCandidateCount = 1;
-            if (g_config.topCandidateCount > 20) g_config.topCandidateCount = 20;
-            if (g_config.varianceThreshold < 0.0f) g_config.varianceThreshold = 0.0f;
+            if (ImGui::Button(g_runtimeAutoDetectEnabled ? "Disable runtime auto detect" : "Enable runtime auto detect")) {
+                g_runtimeAutoDetectEnabled = !g_runtimeAutoDetectEnabled;
+            }
+            ImGui::Text("Effective state: %s", IsAutoDetectActive() ? "ACTIVE" : "inactive");
 
-            ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
-            uint32_t selectedHash = 0;
-            auto hashIt = g_shaderBytecodeHashes.find(g_selectedShaderKey);
-            if (hashIt != g_shaderBytecodeHashes.end()) {
-                selectedHash = hashIt->second;
+            static const char* kDetectModes[] = {"Individual World/View/Projection", "Combined MVP"};
+            ImGui::Combo("Detect mode", &g_autoDetectMode, kDetectModes, IM_ARRAYSIZE(kDetectModes));
+            ImGui::InputInt("Min frames seen", &g_autoDetectMinFramesSeen);
+            ImGui::InputInt("Min consecutive frames", &g_autoDetectMinConsecutiveFrames);
+            if (g_autoDetectMinFramesSeen < 1) g_autoDetectMinFramesSeen = 1;
+            if (g_autoDetectMinConsecutiveFrames < 1) g_autoDetectMinConsecutiveFrames = 1;
+
+            ImGui::Separator();
+            ImGui::TextWrapped("Candidates are ranked by draw-call usage after constant updates, then filtered by temporal stability. Projection candidates also reject orthographic-like signatures and out-of-range FOV values.");
+
+            auto drawBest = [](MatrixSlot slot, const char* label) {
+                AutoCandidateStats best = {};
+                if (!FindBestAutoCandidate(slot, &best)) {
+                    ImGui::Text("%s: <none>", label);
+                    return;
+                }
+                float fovDeg = best.fovSamples > 0 ? (best.averageFov * 180.0f / 3.14159f) : 0.0f;
+                ImGui::Text("%s: shader 0x%p c%d rows=%d draw=%llu frames=%d streak=%d%s",
+                            label,
+                            reinterpret_cast<void*>(best.key.shaderKey),
+                            best.key.base,
+                            best.key.rows,
+                            best.drawCalls,
+                            best.framesSeen,
+                            best.bestConsecutiveFrames,
+                            PassesTemporalStability(best) ? "" : " [unstable]");
+                if (best.fovSamples > 0) {
+                    ImGui::Text("  Avg FOV: %.1f deg", fovDeg);
+                }
+            };
+
+            if (g_autoDetectMode == AutoDetect_MVPOnly) {
+                drawBest(MatrixSlot_MVP, "Best MVP candidate");
+            } else {
+                drawBest(MatrixSlot_View, "Best VIEW candidate");
+                drawBest(MatrixSlot_Projection, "Best PROJECTION candidate");
             }
 
-            if (state && state->snapshotReady) {
-                std::vector<CandidateScore> viewScores;
-                std::vector<CandidateScore> projScores;
-                CollectTopCandidates(*state, &viewScores, &projScores);
+            if (ImGui::BeginTable("AutoDetectCandidates", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Type");
+                ImGui::TableSetupColumn("Shader");
+                ImGui::TableSetupColumn("Base");
+                ImGui::TableSetupColumn("Rows");
+                ImGui::TableSetupColumn("Draws");
+                ImGui::TableSetupColumn("Frames");
+                ImGui::TableSetupColumn("Best Streak");
+                ImGui::TableSetupColumn("Score");
+                ImGui::TableHeadersRow();
 
-                if (g_autoPickCandidates && !viewScores.empty()) {
-                    const CandidateScore& topView = viewScores.front();
-                    g_config.viewMatrixRegister = topView.base;
-                    g_layoutStrategyMode = topView.strategy;
-                }
-                if (g_autoPickCandidates && !projScores.empty()) {
-                    const CandidateScore& topProj = projScores.front();
-                    g_config.projMatrixRegister = topProj.base;
-                }
-
-                if (selectedHash != 0 && ImGui::Button("Save profile for selected shader")) {
-                    HeuristicProfile profile = {};
-                    profile.valid = true;
-                    profile.viewBase = g_config.viewMatrixRegister;
-                    profile.projBase = g_config.projMatrixRegister;
-                    profile.layoutMode = g_layoutStrategyMode;
-                    profile.transposed = g_probeTransposedLayouts;
-                    profile.inverseView = g_probeInverseView;
-                    g_heuristicProfiles[selectedHash] = profile;
-                    SaveHeuristicProfile(selectedHash, profile);
-                    LogMsg("Saved heuristic profile for shader hash 0x%08X", selectedHash);
-                }
-
-                ImGui::Separator();
-                ImGui::Text("VIEW candidates");
-                if (ImGui::BeginTable("ViewCandidates", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                    ImGui::TableSetupColumn("Registers");
-                    ImGui::TableSetupColumn("Score");
-                    ImGui::TableSetupColumn("Variance");
-                    ImGui::TableSetupColumn("Strategy");
-                    ImGui::TableSetupColumn("Transpose");
-                    ImGui::TableSetupColumn("Inverse");
-                    ImGui::TableHeadersRow();
-                    int count = 0;
-                    for (const auto& c : viewScores) {
-                        if (count++ >= g_config.topCandidateCount) break;
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
-                        ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
-                        ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
-                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[(std::max)(0, (std::min)(c.strategy, 4))]);
-                        ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
-                        ImGui::TableSetColumnIndex(5); ImGui::Text("%s", c.inverseView ? "yes" : "no");
+                int shown = 0;
+                for (const auto& entry : g_autoCandidateStats) {
+                    const AutoCandidateStats& c = entry.second;
+                    float score = ComputeAutoCandidateScore(c);
+                    if (score < 0.0f) {
+                        continue;
                     }
-                    ImGui::EndTable();
-                }
-
-                ImGui::Separator();
-                ImGui::Text("PROJECTION candidates");
-                if (ImGui::BeginTable("ProjCandidates", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                    ImGui::TableSetupColumn("Registers");
-                    ImGui::TableSetupColumn("Score");
-                    ImGui::TableSetupColumn("Variance");
-                    ImGui::TableSetupColumn("Strategy");
-                    ImGui::TableSetupColumn("Transpose");
-                    ImGui::TableHeadersRow();
-                    int count = 0;
-                    for (const auto& c : projScores) {
-                        if (count++ >= g_config.topCandidateCount) break;
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0); ImGui::Text("c%d-c%d", c.base, c.base + 3);
-                        ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", c.score);
-                        ImGui::TableSetColumnIndex(2); ImGui::Text("%.6f", c.variance);
-                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", kLayoutModes[(std::max)(0, (std::min)(c.strategy, 4))]);
-                        ImGui::TableSetColumnIndex(4); ImGui::Text("%s", c.transposed ? "yes" : "no");
+                    if (shown++ >= 20) {
+                        break;
                     }
-                    ImGui::EndTable();
+                    const char* typeLabel = c.key.slot == MatrixSlot_View ? "View" :
+                                            c.key.slot == MatrixSlot_Projection ? "Projection" :
+                                            c.key.slot == MatrixSlot_MVP ? "MVP" : "World";
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); ImGui::Text("%s", typeLabel);
+                    ImGui::TableSetColumnIndex(1); ImGui::Text("0x%p", reinterpret_cast<void*>(c.key.shaderKey));
+                    ImGui::TableSetColumnIndex(2); ImGui::Text("c%d", c.key.base);
+                    ImGui::TableSetColumnIndex(3); ImGui::Text("%d", c.key.rows);
+                    ImGui::TableSetColumnIndex(4); ImGui::Text("%llu", c.drawCalls);
+                    ImGui::TableSetColumnIndex(5); ImGui::Text("%d", c.framesSeen);
+                    ImGui::TableSetColumnIndex(6); ImGui::Text("%d", c.bestConsecutiveFrames);
+                    ImGui::TableSetColumnIndex(7); ImGui::Text("%.1f", score);
                 }
-            } else {
-                ImGui::Text("Select a shader in Constants tab first.");
+                ImGui::EndTable();
             }
             ImGui::EndTabItem();
         }

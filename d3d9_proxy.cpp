@@ -117,6 +117,8 @@ struct MatrixSourceInfo {
     int baseRegister = -1;
     int rows = 4;
     bool transposed = false;
+    const char* sourceLabel = "unknown";
+    int extractedFromRegister = -1;
 };
 
 static CameraMatrices g_cameraMatrices = {};
@@ -127,7 +129,9 @@ static void UpdateMatrixSource(MatrixSlot slot,
                                int baseRegister,
                                int rows,
                                bool transposed,
-                               bool manual);
+                               bool manual,
+                               const char* sourceLabel = nullptr,
+                               int extractedFromRegister = -1);
 
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
@@ -281,10 +285,13 @@ static void StoreViewMatrix(const D3DMATRIX& view,
                             int baseRegister = -1,
                             int rows = 4,
                             bool transposed = false,
-                            bool manual = false) {
+                            bool manual = false,
+                            const char* sourceLabel = nullptr,
+                            int extractedFromRegister = -1) {
     g_cameraMatrices.view = view;
     g_cameraMatrices.hasView = true;
-    UpdateMatrixSource(MatrixSlot_View, shaderKey, baseRegister, rows, transposed, manual);
+    UpdateMatrixSource(MatrixSlot_View, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
 }
 
 static void StoreProjectionMatrix(const D3DMATRIX& projection,
@@ -292,10 +299,13 @@ static void StoreProjectionMatrix(const D3DMATRIX& projection,
                                   int baseRegister = -1,
                                   int rows = 4,
                                   bool transposed = false,
-                                  bool manual = false) {
+                                  bool manual = false,
+                                  const char* sourceLabel = nullptr,
+                                  int extractedFromRegister = -1) {
     g_cameraMatrices.projection = projection;
     g_cameraMatrices.hasProjection = true;
-    UpdateMatrixSource(MatrixSlot_Projection, shaderKey, baseRegister, rows, transposed, manual);
+    UpdateMatrixSource(MatrixSlot_Projection, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
 }
 
 static void StoreWorldMatrix(const D3DMATRIX& world,
@@ -303,10 +313,13 @@ static void StoreWorldMatrix(const D3DMATRIX& world,
                              int baseRegister = -1,
                              int rows = 4,
                              bool transposed = false,
-                             bool manual = false) {
+                             bool manual = false,
+                             const char* sourceLabel = nullptr,
+                             int extractedFromRegister = -1) {
     g_cameraMatrices.world = world;
     g_cameraMatrices.hasWorld = true;
-    UpdateMatrixSource(MatrixSlot_World, shaderKey, baseRegister, rows, transposed, manual);
+    UpdateMatrixSource(MatrixSlot_World, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
 }
 
 static void StoreMVPMatrix(const D3DMATRIX& mvp,
@@ -314,10 +327,13 @@ static void StoreMVPMatrix(const D3DMATRIX& mvp,
                            int baseRegister = -1,
                            int rows = 4,
                            bool transposed = false,
-                           bool manual = false) {
+                           bool manual = false,
+                           const char* sourceLabel = nullptr,
+                           int extractedFromRegister = -1) {
     g_cameraMatrices.mvp = mvp;
     g_cameraMatrices.hasMVP = true;
-    UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual);
+    UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
 }
 
 static HMODULE LoadSystemD3D9() {
@@ -507,7 +523,9 @@ static void UpdateMatrixSource(MatrixSlot slot,
                                int baseRegister,
                                int rows,
                                bool transposed,
-                               bool manual) {
+                               bool manual,
+                               const char* sourceLabel,
+                               int extractedFromRegister) {
     MatrixSourceInfo info = {};
     info.valid = true;
     info.manual = manual;
@@ -516,6 +534,8 @@ static void UpdateMatrixSource(MatrixSlot slot,
     info.baseRegister = baseRegister;
     info.rows = rows;
     info.transposed = transposed;
+    info.sourceLabel = sourceLabel ? sourceLabel : (manual ? "manual constants selection" : "auto/config detection");
+    info.extractedFromRegister = extractedFromRegister >= 0 ? extractedFromRegister : baseRegister;
     g_matrixSources[slot] = info;
 }
 
@@ -533,7 +553,7 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
     uint32_t shaderHash = 0;
     bool hasBytecodeHash = TryGetShaderBytecodeHash(source.shaderKey, &shaderHash);
     if (source.shaderKey == 0) {
-        ImGui::Text("Source shader: <unknown>");
+        ImGui::Text("Source shader: <none/runtime>");
     } else {
         ImGui::Text("Source shader: 0x%p", reinterpret_cast<void*>(source.shaderKey));
         if (hasBytecodeHash) {
@@ -544,15 +564,23 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
             ImGui::Text("Shader hash: <pending>");
         }
     }
+
     if (source.baseRegister >= 0) {
         int rows = source.rows > 0 ? source.rows : 4;
-        ImGui::Text("Registers: c%d-c%d (%d rows)%s",
+        ImGui::Text("Stored from: c%d-c%d (%d rows)%s",
                     source.baseRegister,
                     source.baseRegister + (rows - 1),
                     rows,
                     source.transposed ? " [transposed]" : "");
+    } else {
+        ImGui::Text("Stored from: <not from shader constants>");
     }
-    ImGui::Text("Origin: %s", source.manual ? "manual constants selection" : "auto/config detection");
+
+    if (source.extractedFromRegister >= 0 && source.extractedFromRegister != source.baseRegister) {
+        ImGui::Text("Extracted from: c%d", source.extractedFromRegister);
+    }
+
+    ImGui::Text("Origin: %s", source.sourceLabel ? source.sourceLabel : "unknown");
 }
 
 
@@ -583,6 +611,58 @@ static const char* MatrixSlotLabel(MatrixSlot slot) {
         case MatrixSlot_Projection: return "PROJECTION";
         case MatrixSlot_MVP: return "MVP";
         default: return "UNKNOWN";
+    }
+}
+
+static bool SaveConfigRegisterValue(const char* key, int value) {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* lastSlash = strrchr(path, '\\');
+    if (lastSlash) {
+        strcpy(lastSlash + 1, "camera_proxy.ini");
+    }
+
+    char valueBuf[32] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%d", value);
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+}
+
+static void PinRegisterFromSource(MatrixSlot slot) {
+    const MatrixSourceInfo& source = g_matrixSources[slot];
+    if (!source.valid || source.baseRegister < 0) {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Cannot pin %s: no register-backed source available.", MatrixSlotLabel(slot));
+        return;
+    }
+
+    const char* key = nullptr;
+    int* target = nullptr;
+    if (slot == MatrixSlot_View) {
+        key = "ViewMatrixRegister";
+        target = &g_config.viewMatrixRegister;
+    } else if (slot == MatrixSlot_Projection) {
+        key = "ProjMatrixRegister";
+        target = &g_config.projMatrixRegister;
+    } else if (slot == MatrixSlot_World) {
+        key = "WorldMatrixRegister";
+        target = &g_config.worldMatrixRegister;
+    }
+
+    if (!key || !target) {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Pinning is not supported for %s.", MatrixSlotLabel(slot));
+        return;
+    }
+
+    *target = source.baseRegister;
+    if (SaveConfigRegisterValue(key, source.baseRegister)) {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Pinned %s register to c%d and saved to camera_proxy.ini (%s).",
+                 MatrixSlotLabel(slot), source.baseRegister, key);
+    } else {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Pinned %s register to c%d (failed to save camera_proxy.ini).",
+                 MatrixSlotLabel(slot), source.baseRegister);
     }
 }
 
@@ -1429,7 +1509,7 @@ static bool TryPromoteStableAutoCandidate(ShaderConstantState& state,
     if (slot == MatrixSlot_View && g_config.viewMatrixRegister != base) {
         g_config.viewMatrixRegister = base;
         g_manualBindings[MatrixSlot_View].enabled = false;
-        StoreViewMatrix(mat, shaderKey, base, rows, transposed, false);
+        StoreViewMatrix(mat, shaderKey, base, rows, transposed, false, "auto-detect stable candidate");
         LogMsg("AutoDetect refined: promoted stable VIEW matrix c%d-c%d (rows=%d transpose=%d)",
                base, base + rows - 1, rows, transposed ? 1 : 0);
         if (profile) {
@@ -1445,7 +1525,7 @@ static bool TryPromoteStableAutoCandidate(ShaderConstantState& state,
     if (slot == MatrixSlot_Projection && g_config.projMatrixRegister != base) {
         g_config.projMatrixRegister = base;
         g_manualBindings[MatrixSlot_Projection].enabled = false;
-        StoreProjectionMatrix(mat, shaderKey, base, rows, transposed, false);
+        StoreProjectionMatrix(mat, shaderKey, base, rows, transposed, false, "auto-detect stable candidate");
         float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
         LogMsg("AutoDetect refined: promoted stable PROJECTION matrix c%d-c%d (rows=%d transpose=%d FOV %.1f)",
                base, base + rows - 1, rows, transposed ? 1 : 0, fov);
@@ -1715,6 +1795,27 @@ static void RenderImGuiOverlay() {
             DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
+
+            ImGui::Separator();
+            ImGui::Text("Register pinning (camera tab)");
+            ImGui::TextWrapped("Pin currently detected matrix registers directly from this tab. Values are saved to camera_proxy.ini immediately.");
+            if (ImGui::Button("Pin World register")) {
+                PinRegisterFromSource(MatrixSlot_World);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pin View register")) {
+                PinRegisterFromSource(MatrixSlot_View);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pin Projection register")) {
+                PinRegisterFromSource(MatrixSlot_Projection);
+            }
+            ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d",
+                        g_config.worldMatrixRegister, g_config.viewMatrixRegister,
+                        g_config.projMatrixRegister);
+            if (g_matrixAssignStatus[0] != '\0') {
+                ImGui::TextWrapped("%s", g_matrixAssignStatus);
+            }
             ImGui::EndTabItem();
         }
 
@@ -1964,7 +2065,7 @@ static void RenderImGuiOverlay() {
             if (g_config.stabilityFrames < 1) g_config.stabilityFrames = 1;
 
             ImGui::Separator();
-            ImGui::TextWrapped("Stable candidates are pinned by shader hash once promoted, preventing register hopping between unrelated transform sets.");
+            ImGui::TextWrapped("Stable candidates are persisted by shader hash once promoted, preventing register hopping between unrelated transform sets.");
 
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
             if (state) {
@@ -1976,6 +2077,35 @@ static void RenderImGuiOverlay() {
                 if (state->stableProjBase >= 0) {
                     ImGui::Text("  c%d (count=%d)", state->stableProjBase, state->stableProjCount);
                 }
+
+                std::vector<CandidateScore> viewScores;
+                std::vector<CandidateScore> projScores;
+                CollectTopCandidates(*state, &viewScores, &projScores);
+
+                ImGui::Separator();
+                ImGui::Text("Top VIEW candidates");
+                int viewCount = (std::min)(g_config.topCandidateCount, static_cast<int>(viewScores.size()));
+                if (viewCount == 0) {
+                    ImGui::Text("  <none>");
+                }
+                for (int i = 0; i < viewCount; ++i) {
+                    const CandidateScore& entry = viewScores[i];
+                    ImGui::Text("  #%d c%d-c%d score=%.2f var=%.5f transposed=%d inverse=%d",
+                                i + 1, entry.base, entry.base + 3, entry.score, entry.variance,
+                                entry.transposed ? 1 : 0, entry.inverseView ? 1 : 0);
+                }
+
+                ImGui::Text("Top PROJECTION candidates");
+                int projCount = (std::min)(g_config.topCandidateCount, static_cast<int>(projScores.size()));
+                if (projCount == 0) {
+                    ImGui::Text("  <none>");
+                }
+                for (int i = 0; i < projCount; ++i) {
+                    const CandidateScore& entry = projScores[i];
+                    ImGui::Text("  #%d c%d-c%d score=%.2f var=%.5f transposed=%d",
+                                i + 1, entry.base, entry.base + 3, entry.score, entry.variance,
+                                entry.transposed ? 1 : 0);
+                }
             }
 
             uint32_t selectedShaderHash = 0;
@@ -1986,35 +2116,23 @@ static void RenderImGuiOverlay() {
                     profile = &profileIt->second;
                 }
                 const bool hasProfile = profile && profile->valid;
+                ImGui::Separator();
                 ImGui::Text("Selected shader hash: 0x%08X", selectedShaderHash);
-                ImGui::Text("Pinned VIEW: %s", (hasProfile && profile->viewBase >= 0) ? "yes" : "no");
+                ImGui::Text("Persisted VIEW pin: %s", (hasProfile && profile->viewBase >= 0) ? "yes" : "no");
                 if (hasProfile && profile->viewBase >= 0) {
                     ImGui::SameLine();
                     ImGui::Text("c%d", profile->viewBase);
                 }
-                ImGui::Text("Pinned PROJECTION: %s", (hasProfile && profile->projBase >= 0) ? "yes" : "no");
+                ImGui::Text("Persisted PROJECTION pin: %s", (hasProfile && profile->projBase >= 0) ? "yes" : "no");
                 if (hasProfile && profile->projBase >= 0) {
                     ImGui::SameLine();
                     ImGui::Text("c%d", profile->projBase);
                 }
-                if (ImGui::Button("Pin current registers to selected shader")) {
-                    HeuristicProfile& pinned = g_heuristicProfiles[selectedShaderHash];
-                    pinned.valid = true;
-                    pinned.viewBase = g_config.viewMatrixRegister;
-                    pinned.projBase = g_config.projMatrixRegister;
-                    pinned.layoutMode = g_layoutStrategyMode;
-                    pinned.transposed = g_probeTransposedLayouts;
-                    pinned.inverseView = g_probeInverseView;
-                    SaveHeuristicProfile(selectedShaderHash, pinned);
-                    LogMsg("Pinned matrix registers for shader hash 0x%08X: view=c%d proj=c%d",
-                           selectedShaderHash, pinned.viewBase, pinned.projBase);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Clear selected shader pin")) {
+                if (ImGui::Button("Clear selected shader heuristic profile")) {
                     HeuristicProfile cleared = {};
                     SaveHeuristicProfile(selectedShaderHash, cleared);
                     g_heuristicProfiles.erase(selectedShaderHash);
-                    LogMsg("Cleared heuristic pin for shader hash 0x%08X", selectedShaderHash);
+                    LogMsg("Cleared heuristic profile for shader hash 0x%08X", selectedShaderHash);
                 }
             } else {
                 ImGui::Text("Selected shader hash: <not available yet>");
@@ -2047,14 +2165,14 @@ static void RenderImGuiOverlay() {
                         ImGui::PushID(static_cast<int>(i));
                         ImGui::TextWrapped("%s", hit.label.c_str());
                         if (ImGui::Button("Use as View")) {
-                            StoreViewMatrix(hit.matrix, 0, -1, 4, false, true);
+                            StoreViewMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                                      "Assigned VIEW from memory scan @ 0x%p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("Use as Projection")) {
-                            StoreProjectionMatrix(hit.matrix, 0, -1, 4, false, true);
+                            StoreProjectionMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                                      "Assigned PROJECTION from memory scan @ 0x%p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
@@ -2515,7 +2633,7 @@ public:
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
             memcpy(&mvp, effectiveConstantData, sizeof(D3DMATRIX));
-            StoreMVPMatrix(mvp, shaderKey, 0, 4, false, false);
+            StoreMVPMatrix(mvp, shaderKey, 0, 4, false, false, "direct shader constant capture");
 
             bool allowMvpExtraction = IsAutoDetectActive() ||
                                       (g_config.viewMatrixRegister < 0 &&
@@ -2535,8 +2653,8 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    StoreViewMatrix(m_lastViewMatrix, shaderKey, 0, 4, false, false);
-                    StoreProjectionMatrix(m_lastProjMatrix, shaderKey, 0, 4, false, false);
+                    StoreViewMatrix(m_lastViewMatrix, shaderKey, 0, 4, false, false, "derived from MVP constants", 0);
+                    StoreProjectionMatrix(m_lastProjMatrix, shaderKey, 0, 4, false, false, "synthetic projection from MVP camera extraction", 0);
                     EmitFixedFunctionTransforms();
 
                     if (!m_hasView) {
@@ -2665,7 +2783,7 @@ public:
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
                     StoreViewMatrix(m_lastViewMatrix, shaderKey, g_config.viewMatrixRegister, configuredRows,
-                                    transposePass != 0, false);
+                                    transposePass != 0, false, "configured register detection");
                     EmitFixedFunctionTransforms();
                     LogMsg("Extracted VIEW matrix from c%d (rows=%d transpose=%d)",
                            g_config.viewMatrixRegister, configuredRows, transposePass != 0 ? 1 : 0);
@@ -2694,7 +2812,7 @@ public:
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
                     StoreProjectionMatrix(m_lastProjMatrix, shaderKey, g_config.projMatrixRegister, configuredRows,
-                                          transposePass != 0, false);
+                                          transposePass != 0, false, "configured register detection");
                     EmitFixedFunctionTransforms();
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
@@ -2714,7 +2832,7 @@ public:
                                                  false, &mat) && LooksLikeMatrix(reinterpret_cast<const float*>(&mat))) {
                 memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
                 m_hasWorld = true;
-                StoreWorldMatrix(m_lastWorldMatrix, shaderKey, g_config.worldMatrixRegister, configuredRows, false, false);
+                StoreWorldMatrix(m_lastWorldMatrix, shaderKey, g_config.worldMatrixRegister, configuredRows, false, false, "configured register detection");
                 EmitFixedFunctionTransforms();
             }
         }

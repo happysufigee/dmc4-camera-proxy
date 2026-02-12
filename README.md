@@ -48,15 +48,21 @@ Edit `camera_proxy.ini` to adjust behavior:
 | `LayoutStrategyMode` | 0 | Heuristic layout strategy (0=Auto, 1=4x4, 2=4x3, 3=VP, 4=MVP) |
 | `ProbeTransposedLayouts` | 1 | Probe transposed row/column-major matrix conventions |
 | `ProbeInverseView` | 1 | Probe inverse-view interpretation for view candidates |
-| `AutoPickCandidates` | 1 | Auto-apply top view/projection candidates in Heuristics tab |
+| `AutoPickCandidates` | 1 | Auto-promote stable heuristic candidates when auto-detect is enabled |
 | `OverrideScopeMode` | 0 | Shader override lifetime (0=Sticky, 1=One-frame, 2=N-frames) |
 | `OverrideNFrames` | 3 | Lifetime in frames when `OverrideScopeMode=2` |
 
 You can also open the in-game constants view and enable **shader constant editing** to override individual `c#` registers live; overrides are injected into the final `SetVertexShaderConstantF` call (so changes affect rendering) and can be reset per-register or globally from the UI.
 
-The ImGui overlay is now organized into tabs for **Camera**, **Constants**, **Heuristics**, **Memory Scanner**, and **Logs** so matrix candidates, memory-scan results, and runtime logs can be reviewed in one place.
+The ImGui overlay is organized into tabs for **Camera**, **Constants**, **Heuristics**, **Memory Scanner**, and **Logs**:
 
-Heuristic profiles can be saved per shader (hashed by shader bytecode) and persisted in `camera_proxy_profiles.ini` to avoid repeating setup across runs.
+- **Camera**: live World/View/Projection/MVP matrices with explicit source metadata (shader pointer/hash, register span, extraction origin) and one-click register pinning that writes to `camera_proxy.ini`.
+- **Constants**: per-shader register snapshots, matrix-style browsing, live register overrides, and manual assignment buttons (World/View/Projection/MVP).
+- **Heuristics**: runtime tuning controls (layout/transposed/inverse probing), temporal stability info, and ranked candidate lists for the selected shader.
+- **Memory Scanner**: optional process memory scan for matrix-shaped data with quick assignment actions.
+- **Logs**: in-overlay tail of proxy logs with refresh/live update controls.
+
+Heuristic profiles are persisted per shader bytecode hash in `camera_proxy_profiles.ini` so stable auto-detect decisions survive restarts.
 
 ## Troubleshooting
 

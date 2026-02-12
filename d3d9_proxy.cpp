@@ -153,6 +153,7 @@ static int g_autoDetectMinConsecutiveFrames = 4;
 static int g_autoDetectSamplingFrames = 180;
 static int g_autoDetectSamplingStartFrame = -1;
 static bool g_autoDetectSamplingActive = false;
+static bool g_autoDetectSamplingPausedByUser = false;
 
 static int g_iniViewMatrixRegister = 4;
 static int g_iniProjMatrixRegister = 8;
@@ -998,6 +999,12 @@ static void StartAutoDetectSampling() {
     g_autoCandidateStats.clear();
     g_autoDetectSamplingStartFrame = g_frameCount;
     g_autoDetectSamplingActive = true;
+    g_autoDetectSamplingPausedByUser = false;
+}
+
+static void StopAutoDetectSampling() {
+    g_autoDetectSamplingActive = false;
+    g_autoDetectSamplingPausedByUser = true;
 }
 
 static bool IsAutoDetectSamplingWindowOpen() {
@@ -1121,6 +1128,52 @@ static bool FindBestAutoCandidate(MatrixSlot slot, AutoCandidateStats* outStats)
         }
     }
     return found;
+}
+
+void CreateProjectionMatrix(D3DMATRIX* out, float fovY, float aspect, float zNear, float zFar);
+void ExtractCameraFromMVP(const D3DMATRIX& mvp, D3DMATRIX* viewOut);
+
+static bool ApplyAutoCandidateToLegacyDetection(const AutoCandidateStats& best) {
+    if (!best.hasLastMatrix || best.key.base < 0) {
+        return false;
+    }
+
+    switch (best.key.slot) {
+        case MatrixSlot_World:
+            g_config.worldMatrixRegister = best.key.base;
+            g_manualBindings[MatrixSlot_World].enabled = false;
+            StoreWorldMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
+                             best.key.transposed, false);
+            break;
+        case MatrixSlot_View:
+            g_config.viewMatrixRegister = best.key.base;
+            g_manualBindings[MatrixSlot_View].enabled = false;
+            StoreViewMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
+                            best.key.transposed, false);
+            break;
+        case MatrixSlot_Projection:
+            g_config.projMatrixRegister = best.key.base;
+            g_manualBindings[MatrixSlot_Projection].enabled = false;
+            StoreProjectionMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
+                                  best.key.transposed, false);
+            break;
+        case MatrixSlot_MVP: {
+            StoreMVPMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
+                           best.key.transposed, false);
+            D3DMATRIX extractedView = {};
+            D3DMATRIX extractedProj = {};
+            ExtractCameraFromMVP(best.lastMatrix, &extractedView);
+            CreateProjectionMatrix(&extractedProj, 1.047f, 16.0f / 9.0f, 0.1f, 10000.0f);
+            StoreViewMatrix(extractedView, best.key.shaderKey, best.key.base, best.key.rows,
+                            best.key.transposed, false);
+            StoreProjectionMatrix(extractedProj, best.key.shaderKey, best.key.base, best.key.rows,
+                                  best.key.transposed, false);
+            break;
+        }
+        default:
+            return false;
+    }
+    return true;
 }
 
 static float ComputeProjectionLikeScore(const D3DMATRIX& m) {
@@ -1779,12 +1832,29 @@ static void RenderImGuiOverlay() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Stop sampling")) {
-                g_autoDetectSamplingActive = false;
+                StopAutoDetectSampling();
             }
             ImGui::SameLine();
             if (ImGui::Button("Clear sampled candidates")) {
                 g_autoCandidateStats.clear();
-                g_autoDetectSamplingActive = false;
+                StopAutoDetectSampling();
+            }
+
+            if (ImGui::Button("Auto detect and select matrices (legacy)")) {
+                int applied = 0;
+                if (g_autoDetectMode == AutoDetect_MVPOnly) {
+                    AutoCandidateStats best = {};
+                    if (FindBestAutoCandidate(MatrixSlot_MVP, &best) && ApplyAutoCandidateToLegacyDetection(best)) {
+                        applied++;
+                    }
+                } else {
+                    AutoCandidateStats best = {};
+                    if (FindBestAutoCandidate(MatrixSlot_World, &best) && ApplyAutoCandidateToLegacyDetection(best)) applied++;
+                    if (FindBestAutoCandidate(MatrixSlot_View, &best) && ApplyAutoCandidateToLegacyDetection(best)) applied++;
+                    if (FindBestAutoCandidate(MatrixSlot_Projection, &best) && ApplyAutoCandidateToLegacyDetection(best)) applied++;
+                }
+                snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                         "Legacy auto-select applied %d candidate(s).", applied);
             }
 
             const int elapsed = g_autoDetectSamplingStartFrame >= 0 ? (g_frameCount - g_autoDetectSamplingStartFrame) : 0;
@@ -1814,7 +1884,11 @@ static void RenderImGuiOverlay() {
                 ImGui::SameLine();
                 ImGui::PushID(static_cast<int>(slot) + 9000);
                 if (ImGui::Button("Use")) {
-                    TryAssignManualMatrixFromSelection(slot, best.key.shaderKey, best.key.base, best.key.rows, best.lastMatrix);
+                    if (ApplyAutoCandidateToLegacyDetection(best)) {
+                        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                                 "Applied %s auto candidate to legacy detection at c%d-c%d.",
+                                 MatrixSlotLabel(slot), best.key.base, best.key.base + best.key.rows - 1);
+                    }
                 }
                 ImGui::PopID();
                 if (best.fovSamples > 0) {
@@ -1878,7 +1952,11 @@ static void RenderImGuiOverlay() {
                     ImGui::TableSetColumnIndex(9);
                     ImGui::PushID(static_cast<int>(shown) * 31 + static_cast<int>(c.key.slot));
                     if (ImGui::Button("Use##cand")) {
-                        TryAssignManualMatrixFromSelection(c.key.slot, c.key.shaderKey, c.key.base, c.key.rows, c.lastMatrix);
+                        if (ApplyAutoCandidateToLegacyDetection(c)) {
+                            snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                                     "Applied %s auto candidate to legacy detection at c%d-c%d.",
+                                     MatrixSlotLabel(c.key.slot), c.key.base, c.key.base + c.key.rows - 1);
+                        }
                     }
                     ImGui::PopID();
                 }
@@ -2312,6 +2390,7 @@ private:
     bool m_hasPendingViewCandidate = false;
     bool m_hasPendingProjCandidate = false;
     bool m_hasPendingMVPCandidate = false;
+    int m_lastAutoApplyFrame = -1;
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
@@ -2366,6 +2445,10 @@ public:
         if (!IsAutoDetectActive() || !g_autoApplyDetectedMatrices) {
             return;
         }
+        if (m_lastAutoApplyFrame == g_frameCount) {
+            return;
+        }
+        m_lastAutoApplyFrame = g_frameCount;
         if (g_autoDetectSamplingActive) {
             return;
         }
@@ -2377,8 +2460,7 @@ public:
         AutoCandidateStats bestMvp = {};
         if (g_autoDetectMode == AutoDetect_MVPOnly && FindBestAutoCandidate(MatrixSlot_MVP, &bestMvp) &&
             bestMvp.key.shaderKey == shaderKey && bestMvp.hasLastMatrix) {
-            StoreMVPMatrix(bestMvp.lastMatrix, shaderKey, bestMvp.key.base, bestMvp.key.rows,
-                           bestMvp.key.transposed, false);
+            ApplyAutoCandidateToLegacyDetection(bestMvp);
             ExtractCameraFromMVP(bestMvp.lastMatrix, &m_lastViewMatrix);
             CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f / 9.0f, 0.1f, 10000.0f);
             m_hasView = true;
@@ -2396,8 +2478,7 @@ public:
             bestWorld.key.shaderKey == shaderKey && bestWorld.hasLastMatrix) {
             m_lastWorldMatrix = bestWorld.lastMatrix;
             m_hasWorld = true;
-            StoreWorldMatrix(m_lastWorldMatrix, shaderKey, bestWorld.key.base, bestWorld.key.rows,
-                             bestWorld.key.transposed, false);
+            ApplyAutoCandidateToLegacyDetection(bestWorld);
         }
 
         AutoCandidateStats bestView = {};
@@ -2405,8 +2486,7 @@ public:
             bestView.key.shaderKey == shaderKey && bestView.hasLastMatrix) {
             m_lastViewMatrix = bestView.lastMatrix;
             m_hasView = true;
-            StoreViewMatrix(m_lastViewMatrix, shaderKey, bestView.key.base, bestView.key.rows,
-                            bestView.key.transposed, false);
+            ApplyAutoCandidateToLegacyDetection(bestView);
         }
 
         AutoCandidateStats bestProj = {};
@@ -2414,8 +2494,7 @@ public:
             bestProj.key.shaderKey == shaderKey && bestProj.hasLastMatrix) {
             m_lastProjMatrix = bestProj.lastMatrix;
             m_hasProj = true;
-            StoreProjectionMatrix(m_lastProjMatrix, shaderKey, bestProj.key.base, bestProj.key.rows,
-                                  bestProj.key.transposed, false);
+            ApplyAutoCandidateToLegacyDetection(bestProj);
         }
 
         EmitFixedFunctionTransforms();
@@ -2567,7 +2646,7 @@ public:
             }
         }
 
-        if (IsAutoDetectActive() && !g_autoDetectSamplingActive && g_autoCandidateStats.empty()) {
+        if (IsAutoDetectActive() && !g_autoDetectSamplingPausedByUser && !g_autoDetectSamplingActive && g_autoCandidateStats.empty()) {
             StartAutoDetectSampling();
         }
 

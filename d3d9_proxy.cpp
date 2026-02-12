@@ -180,8 +180,8 @@ enum OverrideScopeMode {
 
 struct HeuristicProfile {
     bool valid = false;
-    int viewBase = 4;
-    int projBase = 8;
+    int viewBase = -1;
+    int projBase = -1;
     int layoutMode = Layout_Auto;
     bool transposed = false;
     bool inverseView = false;
@@ -195,6 +195,18 @@ static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
 static std::unordered_map<uint32_t, HeuristicProfile> g_heuristicProfiles = {};
+
+static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
+    if (!outHash || shaderKey == 0) {
+        return false;
+    }
+    auto it = g_shaderBytecodeHashes.find(shaderKey);
+    if (it == g_shaderBytecodeHashes.end() || it->second == 0) {
+        return false;
+    }
+    *outHash = it->second;
+    return true;
+}
 
 struct ShaderConstantState {
     float constants[kMaxConstantRegisters][4] = {};
@@ -434,9 +446,9 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
     if (shaderKey == 0) {
         return 0;
     }
-    auto it = g_shaderBytecodeHashes.find(shaderKey);
-    if (it != g_shaderBytecodeHashes.end()) {
-        return it->second;
+    uint32_t hash = 0;
+    if (TryGetShaderBytecodeHash(shaderKey, &hash)) {
+        return hash;
     }
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
 }
@@ -518,16 +530,26 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
         return;
     }
 
+    uint32_t shaderHash = 0;
+    bool hasBytecodeHash = TryGetShaderBytecodeHash(source.shaderKey, &shaderHash);
     if (source.shaderKey == 0) {
         ImGui::Text("Source shader: <unknown>");
     } else {
-        ImGui::Text("Source shader: 0x%p (hash 0x%08X)", reinterpret_cast<void*>(source.shaderKey), source.shaderHash);
+        ImGui::Text("Source shader: 0x%p", reinterpret_cast<void*>(source.shaderKey));
+        if (hasBytecodeHash) {
+            ImGui::Text("Shader hash: 0x%08X", shaderHash);
+        } else if (source.shaderHash != 0) {
+            ImGui::Text("Shader hash: 0x%08X (fallback)", source.shaderHash);
+        } else {
+            ImGui::Text("Shader hash: <pending>");
+        }
     }
     if (source.baseRegister >= 0) {
+        int rows = source.rows > 0 ? source.rows : 4;
         ImGui::Text("Registers: c%d-c%d (%d rows)%s",
                     source.baseRegister,
-                    source.baseRegister + (source.rows - 1),
-                    source.rows,
+                    source.baseRegister + (rows - 1),
+                    rows,
                     source.transposed ? " [transposed]" : "");
     }
     ImGui::Text("Origin: %s", source.manual ? "manual constants selection" : "auto/config detection");
@@ -700,8 +722,8 @@ static void LoadHeuristicProfiles() {
         if (sscanf(cur, "Shader_%08X", &hash) == 1) {
             HeuristicProfile profile = {};
             profile.valid = GetPrivateProfileIntA(cur, "Valid", 0, path) != 0;
-            profile.viewBase = GetPrivateProfileIntA(cur, "ViewBase", 4, path);
-            profile.projBase = GetPrivateProfileIntA(cur, "ProjBase", 8, path);
+            profile.viewBase = GetPrivateProfileIntA(cur, "ViewBase", -1, path);
+            profile.projBase = GetPrivateProfileIntA(cur, "ProjBase", -1, path);
             profile.layoutMode = GetPrivateProfileIntA(cur, "LayoutMode", Layout_Auto, path);
             profile.transposed = GetPrivateProfileIntA(cur, "Transposed", 0, path) != 0;
             profile.inverseView = GetPrivateProfileIntA(cur, "InverseView", 0, path) != 0;
@@ -1389,12 +1411,35 @@ static bool TryPromoteStableAutoCandidate(ShaderConstantState& state,
         return false;
     }
 
+    uint32_t shaderHash = 0;
+    const bool hasShaderHash = TryGetShaderBytecodeHash(shaderKey, &shaderHash);
+    HeuristicProfile* profile = nullptr;
+    if (hasShaderHash) {
+        profile = &g_heuristicProfiles[shaderHash];
+        if (profile->valid) {
+            if (slot == MatrixSlot_View && profile->viewBase >= 0 && profile->viewBase != base) {
+                return false;
+            }
+            if (slot == MatrixSlot_Projection && profile->projBase >= 0 && profile->projBase != base) {
+                return false;
+            }
+        }
+    }
+
     if (slot == MatrixSlot_View && g_config.viewMatrixRegister != base) {
         g_config.viewMatrixRegister = base;
         g_manualBindings[MatrixSlot_View].enabled = false;
         StoreViewMatrix(mat, shaderKey, base, rows, transposed, false);
         LogMsg("AutoDetect refined: promoted stable VIEW matrix c%d-c%d (rows=%d transpose=%d)",
                base, base + rows - 1, rows, transposed ? 1 : 0);
+        if (profile) {
+            profile->valid = true;
+            profile->viewBase = base;
+            profile->layoutMode = g_layoutStrategyMode;
+            profile->transposed = g_probeTransposedLayouts;
+            profile->inverseView = g_probeInverseView;
+            SaveHeuristicProfile(shaderHash, *profile);
+        }
         return true;
     }
     if (slot == MatrixSlot_Projection && g_config.projMatrixRegister != base) {
@@ -1404,10 +1449,19 @@ static bool TryPromoteStableAutoCandidate(ShaderConstantState& state,
         float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
         LogMsg("AutoDetect refined: promoted stable PROJECTION matrix c%d-c%d (rows=%d transpose=%d FOV %.1f)",
                base, base + rows - 1, rows, transposed ? 1 : 0, fov);
+        if (profile) {
+            profile->valid = true;
+            profile->projBase = base;
+            profile->layoutMode = g_layoutStrategyMode;
+            profile->transposed = g_probeTransposedLayouts;
+            profile->inverseView = g_probeInverseView;
+            SaveHeuristicProfile(shaderHash, *profile);
+        }
         return true;
     }
     return false;
 }
+
 
 static void ScanBuffer(const void* base, size_t size, int& resultsFound) {
     if (!base || size < sizeof(D3DMATRIX)) {
@@ -1900,8 +1954,8 @@ static void RenderImGuiOverlay() {
 
         if (ImGui::BeginTabItem("Heuristics")) {
             ImGui::Text("Refined legacy matrix auto-detection (deterministic)");
-            ImGui::Checkbox("AutoDetectMatrices (runtime)", &g_config.autoDetectMatrices);
-            ImGui::Text("Effective state: %s", IsAutoDetectActive() ? "ACTIVE" : "inactive");
+            ImGui::Text("AutoDetectMatrices (camera_proxy.ini): %s", g_config.autoDetectMatrices ? "ON" : "OFF");
+            ImGui::TextWrapped("This tab is runtime heuristics only. To enable/disable auto-detect, keep using AutoDetectMatrices in camera_proxy.ini.");
             static const char* kLayoutModes[] = {"Auto", "4x4", "4x3", "VP", "MVP"};
             ImGui::Combo("Layout strategy", &g_layoutStrategyMode, kLayoutModes, IM_ARRAYSIZE(kLayoutModes));
             ImGui::Checkbox("Probe transposed layouts", &g_probeTransposedLayouts);
@@ -1910,10 +1964,7 @@ static void RenderImGuiOverlay() {
             if (g_config.stabilityFrames < 1) g_config.stabilityFrames = 1;
 
             ImGui::Separator();
-            ImGui::TextWrapped("Current method: strict view/projection signatures + perspective validation + temporal stability promotion. No probability scoring is used.");
-            ImGui::BulletText("Method A (implemented): strict shape + FOV bounds + orthographic rejection, then promote only after stable streak.");
-            ImGui::BulletText("Method B (recommended): detect View from camera translation continuity and Projection from depth row invariants (_34/_44).");
-            ImGui::BulletText("Method C (recommended): bind matrix registers per shader hash profile once discovered and reuse deterministically.");
+            ImGui::TextWrapped("Stable candidates are pinned by shader hash once promoted, preventing register hopping between unrelated transform sets.");
 
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
             if (state) {
@@ -1925,6 +1976,48 @@ static void RenderImGuiOverlay() {
                 if (state->stableProjBase >= 0) {
                     ImGui::Text("  c%d (count=%d)", state->stableProjBase, state->stableProjCount);
                 }
+            }
+
+            uint32_t selectedShaderHash = 0;
+            if (TryGetShaderBytecodeHash(g_selectedShaderKey, &selectedShaderHash)) {
+                HeuristicProfile* profile = nullptr;
+                auto profileIt = g_heuristicProfiles.find(selectedShaderHash);
+                if (profileIt != g_heuristicProfiles.end()) {
+                    profile = &profileIt->second;
+                }
+                const bool hasProfile = profile && profile->valid;
+                ImGui::Text("Selected shader hash: 0x%08X", selectedShaderHash);
+                ImGui::Text("Pinned VIEW: %s", (hasProfile && profile->viewBase >= 0) ? "yes" : "no");
+                if (hasProfile && profile->viewBase >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("c%d", profile->viewBase);
+                }
+                ImGui::Text("Pinned PROJECTION: %s", (hasProfile && profile->projBase >= 0) ? "yes" : "no");
+                if (hasProfile && profile->projBase >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("c%d", profile->projBase);
+                }
+                if (ImGui::Button("Pin current registers to selected shader")) {
+                    HeuristicProfile& pinned = g_heuristicProfiles[selectedShaderHash];
+                    pinned.valid = true;
+                    pinned.viewBase = g_config.viewMatrixRegister;
+                    pinned.projBase = g_config.projMatrixRegister;
+                    pinned.layoutMode = g_layoutStrategyMode;
+                    pinned.transposed = g_probeTransposedLayouts;
+                    pinned.inverseView = g_probeInverseView;
+                    SaveHeuristicProfile(selectedShaderHash, pinned);
+                    LogMsg("Pinned matrix registers for shader hash 0x%08X: view=c%d proj=c%d",
+                           selectedShaderHash, pinned.viewBase, pinned.projBase);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear selected shader pin")) {
+                    HeuristicProfile cleared = {};
+                    SaveHeuristicProfile(selectedShaderHash, cleared);
+                    g_heuristicProfiles.erase(selectedShaderHash);
+                    LogMsg("Cleared heuristic pin for shader hash 0x%08X", selectedShaderHash);
+                }
+            } else {
+                ImGui::Text("Selected shader hash: <not available yet>");
             }
             ImGui::EndTabItem();
         }
@@ -2815,8 +2908,12 @@ public:
                 auto profileIt = g_heuristicProfiles.find(shaderHash);
                 if (profileIt != g_heuristicProfiles.end() && profileIt->second.valid) {
                     const HeuristicProfile& profile = profileIt->second;
-                    g_config.viewMatrixRegister = profile.viewBase;
-                    g_config.projMatrixRegister = profile.projBase;
+                    if (profile.viewBase >= 0) {
+                        g_config.viewMatrixRegister = profile.viewBase;
+                    }
+                    if (profile.projBase >= 0) {
+                        g_config.projMatrixRegister = profile.projBase;
+                    }
                     g_layoutStrategyMode = profile.layoutMode;
                     g_probeTransposedLayouts = profile.transposed;
                     g_probeInverseView = profile.inverseView;

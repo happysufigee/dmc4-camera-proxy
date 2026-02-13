@@ -49,9 +49,9 @@ class WrappedD3D9Device;
 
 // Configuration
 struct ProxyConfig {
-    int viewMatrixRegister = 4;
-    int projMatrixRegister = 8;
-    int worldMatrixRegister = 0;
+    int viewMatrixRegister = -1;
+    int projMatrixRegister = -1;
+    int worldMatrixRegister = -1;
     bool enableLogging = true;
     float minFOV = 0.1f;
     float maxFOV = 2.5f;
@@ -163,9 +163,9 @@ static int g_autoDetectSamplingStartFrame = -1;
 static bool g_autoDetectSamplingActive = false;
 static bool g_autoDetectSamplingPausedByUser = false;
 
-static int g_iniViewMatrixRegister = 4;
-static int g_iniProjMatrixRegister = 8;
-static int g_iniWorldMatrixRegister = 0;
+static int g_iniViewMatrixRegister = -1;
+static int g_iniProjMatrixRegister = -1;
+static int g_iniWorldMatrixRegister = -1;
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -372,6 +372,43 @@ static HMODULE LoadTargetD3D9() {
     return systemModule;
 }
 
+static float GetWindowDpiScale(HWND hwnd) {
+    if (!hwnd) {
+        return 1.0f;
+    }
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (!user32) {
+        return 1.0f;
+    }
+    typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
+    GetDpiForWindowFn getDpiForWindow =
+        reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(user32, "GetDpiForWindow"));
+    if (!getDpiForWindow) {
+        return 1.0f;
+    }
+    UINT dpi = getDpiForWindow(hwnd);
+    if (dpi == 0) {
+        return 1.0f;
+    }
+    return static_cast<float>(dpi) / 96.0f;
+}
+
+static void ApplyImGuiScale(HWND hwnd) {
+    if (!g_imguiBaseStyleCaptured) {
+        return;
+    }
+    const float dpiScale = GetWindowDpiScale(hwnd);
+    const float clampedUiScale = (std::max)(0.5f, (std::min)(3.0f, g_imguiScaleRuntime));
+    const float finalScale = clampedUiScale * dpiScale;
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = g_imguiBaseStyle;
+    style.ScaleAllSizes(finalScale);
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.FontGlobalScale = finalScale;
+}
+
 static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     if (g_imguiInitialized || !device || !hwnd) {
         return;
@@ -419,9 +456,7 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     g_imguiScaleRuntime = g_config.imguiScale;
     if (g_imguiScaleRuntime < 0.5f) g_imguiScaleRuntime = 0.5f;
     if (g_imguiScaleRuntime > 3.0f) g_imguiScaleRuntime = 3.0f;
-    style = g_imguiBaseStyle;
-    style.ScaleAllSizes(g_imguiScaleRuntime);
-    io.FontGlobalScale = g_imguiScaleRuntime;
+    ApplyImGuiScale(hwnd);
 
     g_imguiInitialized = true;
     g_imguiHwnd = hwnd;
@@ -1727,6 +1762,7 @@ static void RenderImGuiOverlay() {
         return;
     }
 
+    ApplyImGuiScale(g_imguiHwnd);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::GetIO().MouseDrawCursor = true;
@@ -1747,12 +1783,7 @@ static void RenderImGuiOverlay() {
                        "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
 
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
-        ImGuiStyle& style = ImGui::GetStyle();
-        if (g_imguiBaseStyleCaptured) {
-            style = g_imguiBaseStyle;
-            style.ScaleAllSizes(g_imguiScaleRuntime);
-        }
-        ImGui::GetIO().FontGlobalScale = g_imguiScaleRuntime;
+        ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
     }
 
@@ -2361,6 +2392,7 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
 
     return true;
 }
+
 static bool HasPerspectiveComponent(const D3DMATRIX& m) {
     return fabsf(m._34) > 0.5f && fabsf(m._44) < 0.5f;
 }
@@ -2369,9 +2401,46 @@ static bool IsAffineMatrixNoPerspective(const D3DMATRIX& m) {
     return fabsf(m._14) < 0.02f && fabsf(m._24) < 0.02f && fabsf(m._34) < 0.02f && fabsf(m._44 - 1.0f) < 0.02f;
 }
 
-static bool LooksLikeWorldStrict(const D3DMATRIX& m) {
+static bool IsLikelyBoneTransform(const D3DMATRIX& m,
+                                  int rows,
+                                  UINT vectorCountInUpload,
+                                  UINT uploadStartReg,
+                                  UINT candidateBaseReg) {
+    if (!IsAffineMatrixNoPerspective(m)) {
+        return false;
+    }
+
+    const float tx = m._41;
+    const float ty = m._42;
+    const float tz = m._43;
+    const float translationLen = sqrtf(tx * tx + ty * ty + tz * tz);
+
+    const float r0 = sqrtf(Dot3(m._11, m._12, m._13, m._11, m._12, m._13));
+    const float r1 = sqrtf(Dot3(m._21, m._22, m._23, m._21, m._22, m._23));
+    const float r2 = sqrtf(Dot3(m._31, m._32, m._33, m._31, m._32, m._33));
+    const bool nearUnitRows = fabsf(r0 - 1.0f) < 0.25f && fabsf(r1 - 1.0f) < 0.25f && fabsf(r2 - 1.0f) < 0.25f;
+
+    const bool appearsInLargePaletteUpload =
+        rows == 3 && vectorCountInUpload >= 12 && candidateBaseReg >= uploadStartReg &&
+        candidateBaseReg + 2 < uploadStartReg + vectorCountInUpload;
+
+    return nearUnitRows && translationLen < 50.0f && appearsInLargePaletteUpload;
+}
+
+static bool LooksLikeWorldStrict(const D3DMATRIX& m,
+                                 int rows,
+                                 UINT vectorCountInUpload,
+                                 UINT uploadStartReg,
+                                 UINT candidateBaseReg) {
     if (!IsAffineMatrixNoPerspective(m)) return false;
     if (LooksLikeViewStrict(m)) return false;
+
+    const float det = Determinant3x3(m);
+    if (!std::isfinite(det) || fabsf(det) < 0.0001f) return false;
+
+    if (IsLikelyBoneTransform(m, rows, vectorCountInUpload, uploadStartReg, candidateBaseReg)) {
+        return false;
+    }
     return true;
 }
 
@@ -2383,7 +2452,11 @@ enum MatrixClassification {
     MatrixClass_CombinedPerspective
 };
 
-static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m) {
+static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m,
+                                                        int rows,
+                                                        UINT vectorCountInUpload,
+                                                        UINT uploadStartReg,
+                                                        UINT candidateBaseReg) {
     if (LooksLikeProjectionStrict(m)) {
         return MatrixClass_Projection;
     }
@@ -2393,11 +2466,12 @@ static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m) {
     if (LooksLikeViewStrict(m)) {
         return MatrixClass_View;
     }
-    if (LooksLikeWorldStrict(m)) {
+    if (LooksLikeWorldStrict(m, rows, vectorCountInUpload, uploadStartReg, candidateBaseReg)) {
         return MatrixClass_World;
     }
     return MatrixClass_None;
 }
+
 static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX out = {};
     out._11 = a._11*b._11 + a._12*b._21 + a._13*b._31 + a._14*b._41;
@@ -2640,6 +2714,9 @@ public:
         }
         state->snapshotReady = true;
 
+        bool slotResolvedByOverride[MatrixSlot_Count] = {};
+        bool slotResolvedStructurally[MatrixSlot_Count] = {};
+
         if (shaderKey != 0) {
             for (int slot = 0; slot < MatrixSlot_Count; slot++) {
                 const ManualMatrixBinding& binding = g_manualBindings[slot];
@@ -2650,6 +2727,7 @@ public:
                 if (!TryBuildMatrixSnapshot(*state, binding.baseRegister, binding.rows, false, &manualMat)) {
                     continue;
                 }
+                slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = manualMat;
                     m_hasWorld = true;
@@ -2668,36 +2746,65 @@ public:
             }
         }
 
-        auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows) {
-            bool transposed = false;
-            MatrixClassification cls = ClassifyMatrixDeterministic(mat);
-            if (cls == MatrixClass_None && g_probeTransposedLayouts) {
-                D3DMATRIX t = TransposeMatrix(mat);
-                MatrixClassification transposedClass = ClassifyMatrixDeterministic(t);
-                if (transposedClass != MatrixClass_None) {
-                    mat = t;
-                    cls = transposedClass;
-                    transposed = true;
-                }
+        auto tryExplicitRegisterOverride = [&](MatrixSlot slot, int configuredRegister) {
+            if (configuredRegister < 0 || !effectiveConstantData) {
+                return;
             }
+            if (slotResolvedByOverride[slot]) {
+                return;
+            }
+            for (UINT rows : {4u, 3u}) {
+                D3DMATRIX mat = {};
+                if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                      configuredRegister, static_cast<int>(rows), false, &mat)) {
+                    continue;
+                }
+                slotResolvedByOverride[slot] = true;
+                if (slot == MatrixSlot_World) {
+                    m_currentWorld = mat;
+                    m_hasWorld = true;
+                    StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                     "explicit register override");
+                } else if (slot == MatrixSlot_View) {
+                    m_currentView = mat;
+                    m_hasView = true;
+                    StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                    "explicit register override");
+                } else if (slot == MatrixSlot_Projection) {
+                    m_currentProj = mat;
+                    m_hasProj = true;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                          "explicit register override");
+                }
+                return;
+            }
+        };
 
-            const bool allowWorld = g_config.worldMatrixRegister < 0 || g_config.worldMatrixRegister == static_cast<int>(baseReg);
-            const bool allowView = g_config.viewMatrixRegister < 0 || g_config.viewMatrixRegister == static_cast<int>(baseReg);
-            const bool allowProj = g_config.projMatrixRegister < 0 || g_config.projMatrixRegister == static_cast<int>(baseReg);
+        tryExplicitRegisterOverride(MatrixSlot_World, g_config.worldMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_View, g_config.viewMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_Projection, g_config.projMatrixRegister);
 
-            if (cls == MatrixClass_Projection && allowProj) {
+        auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows, bool transposed) {
+            MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
+
+            if (cls == MatrixClass_Projection && g_config.projMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_Projection]) {
                 m_currentProj = mat;
                 m_hasProj = true;
+                slotResolvedStructurally[MatrixSlot_Projection] = true;
                 StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural projection");
-            } else if (cls == MatrixClass_View && allowView) {
+            } else if (cls == MatrixClass_View && g_config.viewMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_View]) {
                 m_currentView = mat;
                 m_hasView = true;
+                slotResolvedStructurally[MatrixSlot_View] = true;
                 StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural view");
-            } else if (cls == MatrixClass_World && allowWorld) {
+            } else if (cls == MatrixClass_World && g_config.worldMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_World]) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
+                slotResolvedStructurally[MatrixSlot_World] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
-            } else if (cls == MatrixClass_CombinedPerspective && allowProj) {
+            } else if (cls == MatrixClass_CombinedPerspective &&
+                       g_config.worldMatrixRegister < 0 && g_config.viewMatrixRegister < 0 && g_config.projMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection]) {
                 D3DMATRIX identity = {};
                 CreateIdentityMatrix(&identity);
                 m_currentWorld = identity;
@@ -2706,10 +2813,14 @@ public:
                 m_hasWorld = true;
                 m_hasView = true;
                 m_hasProj = true;
+                slotResolvedStructurally[MatrixSlot_World] = true;
+                slotResolvedStructurally[MatrixSlot_View] = true;
+                slotResolvedStructurally[MatrixSlot_Projection] = true;
                 StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic combined VP/MVP fallback");
             }
         };
 
+        bool anyStructuralMatch = false;
         if (effectiveConstantData && Vector4fCount >= 3) {
             for (UINT rows : {4u, 3u}) {
                 if (Vector4fCount < rows) {
@@ -2723,7 +2834,56 @@ public:
                                                           false, &mat)) {
                         continue;
                     }
-                    updateFromClassification(mat, baseReg, static_cast<int>(rows));
+
+                    MatrixClassification directClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                    bool transposed = false;
+                    if (directClass == MatrixClass_None && g_probeTransposedLayouts) {
+                        D3DMATRIX t = TransposeMatrix(mat);
+                        MatrixClassification transposedClass = ClassifyMatrixDeterministic(t, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                        if (transposedClass != MatrixClass_None) {
+                            mat = t;
+                            transposed = true;
+                        }
+                    }
+
+                    MatrixClassification finalClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                    if (finalClass != MatrixClass_None) {
+                        anyStructuralMatch = true;
+                        updateFromClassification(mat, baseReg, static_cast<int>(rows), transposed);
+                    }
+                }
+            }
+        }
+
+        const bool allowLegacyHeuristics = g_config.autoDetectMatrices && !anyStructuralMatch &&
+                                           g_config.worldMatrixRegister < 0 &&
+                                           g_config.viewMatrixRegister < 0 &&
+                                           g_config.projMatrixRegister < 0;
+        if (allowLegacyHeuristics && state) {
+            std::vector<CandidateScore> viewScores;
+            std::vector<CandidateScore> projScores;
+            CollectTopCandidates(*state, &viewScores, &projScores);
+
+            if (!slotResolvedByOverride[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_View] && !viewScores.empty()) {
+                const CandidateScore& top = viewScores.front();
+                D3DMATRIX view = {};
+                if (TryBuildMatrixSnapshot(*state, top.base, (top.strategy == Layout_4x3) ? 3 : 4,
+                                           top.transposed, &view) && LooksLikeViewStrict(view)) {
+                    m_currentView = view;
+                    m_hasView = true;
+                    StoreViewMatrix(m_currentView, shaderKey, top.base, (top.strategy == Layout_4x3) ? 3 : 4,
+                                    top.transposed, false, "legacy heuristic fallback view");
+                }
+            }
+
+            if (!slotResolvedByOverride[MatrixSlot_Projection] && !slotResolvedStructurally[MatrixSlot_Projection] && !projScores.empty()) {
+                const CandidateScore& top = projScores.front();
+                D3DMATRIX proj = {};
+                if (TryBuildMatrixSnapshot(*state, top.base, 4, top.transposed, &proj) && LooksLikeProjectionStrict(proj)) {
+                    m_currentProj = proj;
+                    m_hasProj = true;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, top.base, 4,
+                                          top.transposed, false, "legacy heuristic fallback projection");
                 }
             }
         }
@@ -3159,9 +3319,9 @@ void LoadConfig() {
         strcpy(lastSlash + 1, "camera_proxy.ini");
     }
 
-    g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", 4, path);
-    g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", 8, path);
-    g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", 0, path);
+    g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", -1, path);
+    g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", -1, path);
+    g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", -1, path);
     g_iniViewMatrixRegister = g_config.viewMatrixRegister;
     g_iniProjMatrixRegister = g_config.projMatrixRegister;
     g_iniWorldMatrixRegister = g_config.worldMatrixRegister;
@@ -3215,8 +3375,18 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
             LogMsg("=== DMC4 Camera Proxy for D3D9 ===");
-            LogMsg("View matrix register: c%d-c%d", g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
-            LogMsg("Projection matrix register: c%d-c%d", g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
+            LogMsg("View matrix register override: %s", g_config.viewMatrixRegister >= 0 ? "ENABLED" : "auto");
+            if (g_config.viewMatrixRegister >= 0) {
+                LogMsg("  View override range: c%d-c%d", g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
+            }
+            LogMsg("Projection matrix register override: %s", g_config.projMatrixRegister >= 0 ? "ENABLED" : "auto");
+            if (g_config.projMatrixRegister >= 0) {
+                LogMsg("  Projection override range: c%d-c%d", g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
+            }
+            LogMsg("World matrix register override: %s", g_config.worldMatrixRegister >= 0 ? "ENABLED" : "auto");
+            if (g_config.worldMatrixRegister >= 0) {
+                LogMsg("  World override range: c%d-c%d", g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
+            }
             LogMsg("Auto-detect matrices: %s", g_config.autoDetectMatrices ? "ENABLED" : "disabled");
             LogMsg("Log all constants: %s", g_config.logAllConstants ? "ENABLED" : "disabled");
             LogMsg("Stability frames: %d", g_config.stabilityFrames);

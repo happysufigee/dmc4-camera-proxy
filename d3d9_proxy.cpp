@@ -88,6 +88,30 @@ struct ProxyConfig {
     int hotkeyTogglePauseVk = VK_F9;
     int hotkeyEmitMatricesVk = VK_F8;
     int hotkeyResetMatrixOverridesVk = VK_F7;
+
+    bool enableCombinedMVP = false;
+    bool combinedMVPRequireWorld = false;
+    bool combinedMVPAssumeIdentityWorld = true;
+    bool combinedMVPForceDecomposition = false;
+    bool combinedMVPLogDecomposition = false;
+};
+
+enum CombinedMVPStrategy {
+    CombinedMVPStrategy_None = 0,
+    CombinedMVPStrategy_WorldAndMVP,
+    CombinedMVPStrategy_MVPOnly,
+    CombinedMVPStrategy_WorldRequiredNoWorld,
+    CombinedMVPStrategy_Disabled,
+    CombinedMVPStrategy_SkippedFullWVP,
+    CombinedMVPStrategy_Failed
+};
+
+struct CombinedMVPDebugState {
+    int registerBase = -1;
+    CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
+    bool succeeded = false;
+    float fovRadians = 0.0f;
+    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
 };
 
 enum GameProfileKind {
@@ -205,6 +229,7 @@ static bool g_projectionDetectedByNumericStructure = false;
 static float g_projectionDetectedFovRadians = 0.0f;
 static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+static CombinedMVPDebugState g_combinedMvpDebug = {};
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -717,6 +742,10 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
     char valueBuf[32] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%d", value);
     return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+}
+
+static bool SaveConfigBoolValue(const char* key, bool value) {
+    return SaveConfigRegisterValue(key, value ? 1 : 0);
 }
 
 static bool ConsumeSingleKeyHotkey(HotkeyAction action, int virtualKey) {
@@ -1634,6 +1663,35 @@ static void RenderImGuiOverlay() {
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
 
+            if (ImGui::CollapsingHeader("Combined MVP handling", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::Checkbox("Enable Combined MVP", &g_config.enableCombinedMVP)) {
+                    SaveConfigBoolValue("EnableCombinedMVP", g_config.enableCombinedMVP);
+                }
+                if (ImGui::Checkbox("Require World", &g_config.combinedMVPRequireWorld)) {
+                    SaveConfigBoolValue("CombinedMVPRequireWorld", g_config.combinedMVPRequireWorld);
+                }
+                if (ImGui::Checkbox("Assume Identity World", &g_config.combinedMVPAssumeIdentityWorld)) {
+                    SaveConfigBoolValue("CombinedMVPAssumeIdentityWorld", g_config.combinedMVPAssumeIdentityWorld);
+                }
+                if (ImGui::Checkbox("Force Decomposition", &g_config.combinedMVPForceDecomposition)) {
+                    SaveConfigBoolValue("CombinedMVPForceDecomposition", g_config.combinedMVPForceDecomposition);
+                }
+                if (ImGui::Checkbox("Log Decomposition", &g_config.combinedMVPLogDecomposition)) {
+                    SaveConfigBoolValue("CombinedMVPLogDecomposition", g_config.combinedMVPLogDecomposition);
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Current MVP register: %s", g_combinedMvpDebug.registerBase >= 0 ? "captured" : "n/a");
+                if (g_combinedMvpDebug.registerBase >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("(c%d)", g_combinedMvpDebug.registerBase);
+                }
+                ImGui::Text("Strategy selected: %s", CombinedMVPStrategyLabel(g_combinedMvpDebug.strategy));
+                ImGui::Text("Decomposition succeeded: %s", g_combinedMvpDebug.succeeded ? "yes" : "no");
+                ImGui::Text("Extracted FOV: %.2f deg", g_combinedMvpDebug.fovRadians * 180.0f / 3.14159265f);
+                ImGui::Text("Handedness: %s", ProjectionHandednessLabel(g_combinedMvpDebug.handedness));
+            }
+
             ImGui::Separator();
             ImGui::Text("Register pinning (camera tab)");
             ImGui::TextWrapped("Pin currently detected matrix registers directly from this tab. Values are saved to camera_proxy.ini immediately. Use reset to return to auto-detect.");
@@ -2139,6 +2197,20 @@ static const char* ProjectionHandednessLabel(ProjectionHandedness handedness) {
     }
 }
 
+static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy) {
+    switch (strategy) {
+        case CombinedMVPStrategy_WorldAndMVP: return "Strategy 1 (World + MVP)";
+        case CombinedMVPStrategy_MVPOnly: return "Strategy 2 (MVP only)";
+        case CombinedMVPStrategy_WorldRequiredNoWorld: return "Strategy 3 (world required, missing)";
+        case CombinedMVPStrategy_Disabled: return "Disabled";
+        case CombinedMVPStrategy_SkippedFullWVP: return "Skipped (full W/V/P already present)";
+        case CombinedMVPStrategy_Failed: return "Failed";
+        case CombinedMVPStrategy_None:
+        default:
+            return "None";
+    }
+}
+
 static bool HasPerspectiveComponent(const D3DMATRIX& m) {
     return fabsf(m._34) > 0.5f && fabsf(m._44) < 0.5f;
 }
@@ -2309,6 +2381,147 @@ void CreateProjectionMatrix(D3DMATRIX* out, float fovY, float aspect, float zNea
     out->_33 = zFar / (zFar - zNear);
     out->_34 = 1.0f;
     out->_43 = -zNear * zFar / (zFar - zNear);
+}
+
+static void CreateProjectionMatrixWithHandedness(D3DMATRIX* out,
+                                                 float fovY,
+                                                 float aspect,
+                                                 float zNear,
+                                                 float zFar,
+                                                 ProjectionHandedness handedness) {
+    CreateProjectionMatrix(out, fovY, aspect, zNear, zFar);
+    if (handedness == ProjectionHandedness_Right) {
+        out->_33 = zFar / (zNear - zFar);
+        out->_34 = -1.0f;
+        out->_43 = zNear * zFar / (zNear - zFar);
+    }
+}
+
+static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
+    if (!view) {
+        return;
+    }
+
+    float r0x = view->_11, r0y = view->_12, r0z = view->_13;
+    float r1x = view->_21, r1y = view->_22, r1z = view->_23;
+
+    const float len0 = sqrtf(Dot3(r0x, r0y, r0z, r0x, r0y, r0z));
+    if (len0 > 1e-6f) {
+        r0x /= len0; r0y /= len0; r0z /= len0;
+    }
+
+    float dot01 = Dot3(r1x, r1y, r1z, r0x, r0y, r0z);
+    r1x -= dot01 * r0x;
+    r1y -= dot01 * r0y;
+    r1z -= dot01 * r0z;
+
+    const float len1 = sqrtf(Dot3(r1x, r1y, r1z, r1x, r1y, r1z));
+    if (len1 > 1e-6f) {
+        r1x /= len1; r1y /= len1; r1z /= len1;
+    }
+
+    const float r2x = r0y * r1z - r0z * r1y;
+    const float r2y = r0z * r1x - r0x * r1z;
+    const float r2z = r0x * r1y - r0y * r1x;
+
+    view->_11 = r0x; view->_12 = r0y; view->_13 = r0z; view->_14 = 0.0f;
+    view->_21 = r1x; view->_22 = r1y; view->_23 = r1z; view->_24 = 0.0f;
+    view->_31 = r2x; view->_32 = r2y; view->_33 = r2z; view->_34 = 0.0f;
+    view->_44 = 1.0f;
+}
+
+static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
+                                             ProjectionAnalysis* outAnalysis,
+                                             D3DMATRIX* outProjection,
+                                             bool forceDecomposition) {
+    if (!outProjection) {
+        return false;
+    }
+
+    const float sx = sqrtf(Dot3(combined._11, combined._12, combined._13,
+                                combined._11, combined._12, combined._13));
+    const float sy = sqrtf(Dot3(combined._21, combined._22, combined._23,
+                                combined._21, combined._22, combined._23));
+    if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 1e-5f || sy < 1e-5f) {
+        return false;
+    }
+
+    const float fov = 2.0f * atanf(1.0f / sy);
+    const float aspect = sy / sx;
+    if (!forceDecomposition) {
+        if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
+            return false;
+        }
+    }
+
+    const float det = Determinant3x3(combined);
+    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
+    if (std::isfinite(det)) {
+        handedness = (det < 0.0f) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
+    }
+
+    CreateProjectionMatrixWithHandedness(outProjection,
+                                         fov,
+                                         (std::max)(0.1f, aspect),
+                                         0.1f,
+                                         1000.0f,
+                                         handedness);
+
+    if (outAnalysis) {
+        outAnalysis->valid = true;
+        outAnalysis->fovRadians = fov;
+        outAnalysis->handedness = handedness;
+    }
+    return true;
+}
+
+static bool TryDecomposeCombinedMVP(const D3DMATRIX& mvp,
+                                    const D3DMATRIX* worldOptional,
+                                    bool worldAvailable,
+                                    D3DMATRIX* outWorld,
+                                    D3DMATRIX* outView,
+                                    D3DMATRIX* outProjection,
+                                    ProjectionAnalysis* outProjectionAnalysis) {
+    if (!outWorld || !outView || !outProjection) {
+        return false;
+    }
+
+    D3DMATRIX world = {};
+    D3DMATRIX viewProjection = {};
+
+    if (worldAvailable && worldOptional) {
+        world = *worldOptional;
+        D3DMATRIX worldInv = {};
+        if (!InvertMatrix4x4Deterministic(world, &worldInv, nullptr)) {
+            return false;
+        }
+        viewProjection = MultiplyMatrix(mvp, worldInv);
+    } else {
+        CreateIdentityMatrix(&world);
+        viewProjection = mvp;
+    }
+
+    ProjectionAnalysis analysis = {};
+    D3DMATRIX projection = {};
+    if (!TryExtractProjectionFromCombined(viewProjection, &analysis, &projection, g_config.combinedMVPForceDecomposition)) {
+        return false;
+    }
+
+    D3DMATRIX projectionInv = {};
+    if (!InvertMatrix4x4Deterministic(projection, &projectionInv, nullptr)) {
+        return false;
+    }
+
+    D3DMATRIX view = MultiplyMatrix(projectionInv, viewProjection);
+    OrthonormalizeViewMatrix(&view);
+
+    *outWorld = world;
+    *outView = view;
+    *outProjection = projection;
+    if (outProjectionAnalysis) {
+        *outProjectionAnalysis = analysis;
+    }
+    return true;
 }
 
 // Create an identity matrix
@@ -2765,6 +2978,96 @@ public:
         tryExplicitRegisterOverride(MatrixSlot_View, g_config.viewMatrixRegister);
         tryExplicitRegisterOverride(MatrixSlot_Projection, g_config.projMatrixRegister);
 
+        auto tryHandleCombinedMVP = [&](const D3DMATRIX& combinedMvp, UINT baseReg, int rows, bool transposed) {
+            StoreMVPMatrix(combinedMvp, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
+                           "deterministic structural combined MVP", static_cast<int>(baseReg));
+            g_combinedMvpDebug.registerBase = static_cast<int>(baseReg);
+            g_combinedMvpDebug.succeeded = false;
+            g_combinedMvpDebug.fovRadians = 0.0f;
+            g_combinedMvpDebug.handedness = ProjectionHandedness_Unknown;
+
+            if (!g_config.enableCombinedMVP) {
+                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Disabled;
+                return;
+            }
+            if (m_hasWorld && m_hasView && m_hasProj) {
+                g_combinedMvpDebug.strategy = CombinedMVPStrategy_SkippedFullWVP;
+                return;
+            }
+
+            const bool worldAvailable = m_hasWorld;
+            CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
+            if (worldAvailable) {
+                strategy = CombinedMVPStrategy_WorldAndMVP;
+            } else if (g_config.combinedMVPRequireWorld) {
+                strategy = CombinedMVPStrategy_WorldRequiredNoWorld;
+            } else if (g_config.combinedMVPAssumeIdentityWorld) {
+                strategy = CombinedMVPStrategy_MVPOnly;
+            } else {
+                strategy = CombinedMVPStrategy_Failed;
+            }
+            g_combinedMvpDebug.strategy = strategy;
+
+            if (strategy == CombinedMVPStrategy_WorldRequiredNoWorld) {
+                if (g_config.combinedMVPLogDecomposition) {
+                    LogMsg("Combined MVP ignored at c%d-c%d: world required but missing.",
+                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
+                }
+                return;
+            }
+
+            D3DMATRIX decompWorld = {};
+            D3DMATRIX decompView = {};
+            D3DMATRIX decompProj = {};
+            ProjectionAnalysis projectionInfo = {};
+            if (!TryDecomposeCombinedMVP(combinedMvp,
+                                         worldAvailable ? &m_currentWorld : nullptr,
+                                         worldAvailable,
+                                         &decompWorld,
+                                         &decompView,
+                                         &decompProj,
+                                         &projectionInfo)) {
+                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Failed;
+                if (g_config.combinedMVPLogDecomposition) {
+                    LogMsg("Combined MVP decomposition failed at c%d-c%d.",
+                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
+                }
+                return;
+            }
+
+            m_currentWorld = decompWorld;
+            m_currentView = decompView;
+            m_currentProj = decompProj;
+            m_hasWorld = true;
+            m_hasView = true;
+            m_hasProj = true;
+            slotResolvedStructurally[MatrixSlot_World] = true;
+            slotResolvedStructurally[MatrixSlot_View] = true;
+            slotResolvedStructurally[MatrixSlot_Projection] = true;
+            g_projectionDetectedByNumericStructure = true;
+            g_projectionDetectedFovRadians = projectionInfo.fovRadians;
+            g_projectionDetectedRegister = static_cast<int>(baseReg);
+            g_projectionDetectedHandedness = projectionInfo.handedness;
+
+            StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
+                             "combined MVP decomposition world", static_cast<int>(baseReg));
+            StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
+                            "combined MVP decomposition view", static_cast<int>(baseReg));
+            StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
+                                  "combined MVP decomposition projection", static_cast<int>(baseReg));
+
+            g_combinedMvpDebug.succeeded = true;
+            g_combinedMvpDebug.fovRadians = projectionInfo.fovRadians;
+            g_combinedMvpDebug.handedness = projectionInfo.handedness;
+            if (g_config.combinedMVPLogDecomposition) {
+                LogMsg("Combined MVP decomposition success at c%d-c%d using %s, FOV=%.2f deg, handedness=%s.",
+                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
+                       CombinedMVPStrategyLabel(strategy),
+                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
+                       ProjectionHandednessLabel(projectionInfo.handedness));
+            }
+        };
+
         auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows, bool transposed) {
             MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
 
@@ -2798,23 +3101,9 @@ public:
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
             } else if (cls == MatrixClass_CombinedPerspective &&
                        g_config.worldMatrixRegister < 0 && g_config.viewMatrixRegister < 0 && g_config.projMatrixRegister < 0 &&
-                       !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection]) {
-                D3DMATRIX identity = {};
-                CreateIdentityMatrix(&identity);
-                m_currentWorld = identity;
-                m_currentView = identity;
-                m_currentProj = mat;
-                m_hasWorld = true;
-                m_hasView = true;
-                m_hasProj = true;
-                slotResolvedStructurally[MatrixSlot_World] = true;
-                slotResolvedStructurally[MatrixSlot_View] = true;
-                slotResolvedStructurally[MatrixSlot_Projection] = true;
-                g_projectionDetectedByNumericStructure = false;
-                g_projectionDetectedRegister = static_cast<int>(baseReg);
-                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-                g_projectionDetectedFovRadians = 0.0f;
-                StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic combined VP/MVP fallback");
+                       !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection] &&
+                       rows == 4) {
+                tryHandleCombinedMVP(mat, baseReg, rows, transposed);
             }
         };
 
@@ -2982,6 +3271,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) override { return m_real->SetDepthStencilSurface(pNewZStencil); }
     HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) override { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
     HRESULT STDMETHODCALLTYPE BeginScene() override {
+        g_combinedMvpDebug = {};
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR frame lifecycle: keep projection/view persistent across draws and frames,
             // but require a fresh world upload for each frame.
@@ -3377,6 +3667,11 @@ void LoadConfig() {
     g_config.hotkeyTogglePauseVk = GetPrivateProfileIntA("CameraProxy", "HotkeyTogglePauseVK", VK_F9, path);
     g_config.hotkeyEmitMatricesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyEmitMatricesVK", VK_F8, path);
     g_config.hotkeyResetMatrixOverridesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyResetMatrixOverridesVK", VK_F7, path);
+    g_config.enableCombinedMVP = GetPrivateProfileIntA("CameraProxy", "EnableCombinedMVP", 0, path) != 0;
+    g_config.combinedMVPRequireWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPRequireWorld", 0, path) != 0;
+    g_config.combinedMVPAssumeIdentityWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPAssumeIdentityWorld", 1, path) != 0;
+    g_config.combinedMVPForceDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPForceDecomposition", 0, path) != 0;
+    g_config.combinedMVPLogDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPLogDecomposition", 0, path) != 0;
 
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
@@ -3413,6 +3708,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
             LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
             LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
+            LogMsg("Combined MVP handling: %s", g_config.enableCombinedMVP ? "ENABLED" : "disabled");
+            LogMsg("Combined MVP require world: %s", g_config.combinedMVPRequireWorld ? "yes" : "no");
+            LogMsg("Combined MVP assume identity world: %s", g_config.combinedMVPAssumeIdentityWorld ? "yes" : "no");
+            LogMsg("Combined MVP force decomposition: %s", g_config.combinedMVPForceDecomposition ? "yes" : "no");
+            LogMsg("Combined MVP log decomposition: %s", g_config.combinedMVPLogDecomposition ? "yes" : "no");
             LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
             if (g_activeGameProfile == GameProfile_Barnyard2006) {
                 LogMsg("Barnyard layout: proj=c%d-c%d, viewWorld=c%d-c%d, modelViews=c%d..c%d (%d matrices)",

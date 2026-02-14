@@ -71,10 +71,6 @@ struct ProxyConfig {
     bool enableLogging = true;
     float minFOV = 0.1f;
     float maxFOV = 2.5f;
-    int stabilityFrames = 5;
-    float varianceThreshold = 0.0025f;
-    int topCandidateCount = 5;
-    bool logCandidateSummary = true;
     bool enableMemoryScanner = false;
     int memoryScannerIntervalSec = 0;
     int memoryScannerMaxResults = 25;
@@ -154,11 +150,6 @@ enum MatrixSlot {
     MatrixSlot_Count = 4
 };
 
-enum AutoDetectMode {
-    AutoDetect_IndividualWVP = 0,
-    AutoDetect_MVPOnly = 1
-};
-
 
 struct ManualMatrixBinding {
     bool enabled = false;
@@ -210,15 +201,6 @@ static bool g_requestManualEmit = false;
 static char g_manualEmitStatus[192] = "";
 static char g_matrixAssignStatus[256] = "";
 static int g_manualAssignRows = 4;
-static bool g_runtimeAutoDetectEnabled = false;
-static bool g_autoApplyDetectedMatrices = true;
-static int g_autoDetectMode = AutoDetect_IndividualWVP;
-static int g_autoDetectMinFramesSeen = 12;
-static int g_autoDetectMinConsecutiveFrames = 4;
-static int g_autoDetectSamplingFrames = 180;
-static int g_autoDetectSamplingStartFrame = -1;
-static bool g_autoDetectSamplingActive = false;
-static bool g_autoDetectSamplingPausedByUser = false;
 static bool g_projectionDetectedByNumericStructure = false;
 static float g_projectionDetectedFovRadians = 0.0f;
 static int g_projectionDetectedRegister = -1;
@@ -243,37 +225,17 @@ static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
 
-enum LayoutStrategyMode {
-    Layout_Auto = 0,
-    Layout_4x4 = 1,
-    Layout_4x3 = 2,
-    Layout_VP = 3,
-    Layout_MVP = 4
-};
-
 enum OverrideScopeMode {
     Override_Sticky = 0,
     Override_OneFrame = 1,
     Override_NFrames = 2
 };
 
-struct HeuristicProfile {
-    bool valid = false;
-    int viewBase = -1;
-    int projBase = -1;
-    int layoutMode = Layout_Auto;
-    bool transposed = false;
-    bool inverseView = false;
-};
-
-static int g_layoutStrategyMode = Layout_Auto;
 static bool g_probeTransposedLayouts = true;
 static bool g_probeInverseView = true;
-static bool g_autoPickCandidates = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
-static std::unordered_map<uint32_t, HeuristicProfile> g_heuristicProfiles = {};
 
 static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
     if (!outHash || shaderKey == 0) {
@@ -779,14 +741,14 @@ static void ResetMatrixRegisterOverridesToAuto() {
     bool savedAll = savedWorld && savedView && savedProj;
     if (g_config.autoDetectMatrices) {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-                 "Cleared matrix register overrides. Falling back to heuristic auto-detect (AutoDetectMatrices=1).%s",
+                 "Cleared matrix register overrides. Falling back to deterministic auto-detect (AutoDetectMatrices=1).%s",
                  savedAll ? "" : " Failed to persist at least one key to camera_proxy.ini.");
     } else {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                  "Cleared matrix register overrides. Runtime now uses structural detection.%s",
                  savedAll ? "" : " Failed to persist at least one key to camera_proxy.ini.");
     }
-    LogMsg("Matrix register overrides reset to auto (heuristics=%s).", g_config.autoDetectMatrices ? "on" : "off");
+    LogMsg("Matrix register overrides reset to auto (AutoDetectMatrices=%s).", g_config.autoDetectMatrices ? "on" : "off");
 }
 
 static void PinRegisterFromSource(MatrixSlot slot) {
@@ -913,68 +875,6 @@ static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
         return 0;
     }
     return HashBytesFNV1a(data.data(), size);
-}
-
-static void GetProfilesPath(char* outPath, size_t outSize) {
-    if (!outPath || outSize == 0) {
-        return;
-    }
-    GetModuleFileNameA(nullptr, outPath, static_cast<DWORD>(outSize));
-    char* lastSlash = strrchr(outPath, '\\');
-    if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy_profiles.ini");
-    }
-}
-
-static void SaveHeuristicProfile(uint32_t shaderHash, const HeuristicProfile& profile) {
-    char path[MAX_PATH] = {};
-    GetProfilesPath(path, MAX_PATH);
-    char section[64] = {};
-    snprintf(section, sizeof(section), "Shader_%08X", shaderHash);
-    char value[64] = {};
-
-    snprintf(value, sizeof(value), "%d", profile.valid ? 1 : 0);
-    WritePrivateProfileStringA(section, "Valid", value, path);
-    snprintf(value, sizeof(value), "%d", profile.viewBase);
-    WritePrivateProfileStringA(section, "ViewBase", value, path);
-    snprintf(value, sizeof(value), "%d", profile.projBase);
-    WritePrivateProfileStringA(section, "ProjBase", value, path);
-    snprintf(value, sizeof(value), "%d", profile.layoutMode);
-    WritePrivateProfileStringA(section, "LayoutMode", value, path);
-    snprintf(value, sizeof(value), "%d", profile.transposed ? 1 : 0);
-    WritePrivateProfileStringA(section, "Transposed", value, path);
-    snprintf(value, sizeof(value), "%d", profile.inverseView ? 1 : 0);
-    WritePrivateProfileStringA(section, "InverseView", value, path);
-}
-
-static void LoadHeuristicProfiles() {
-    g_heuristicProfiles.clear();
-    char path[MAX_PATH] = {};
-    GetProfilesPath(path, MAX_PATH);
-
-    char sections[32768] = {};
-    DWORD len = GetPrivateProfileSectionNamesA(sections, sizeof(sections), path);
-    if (len == 0) {
-        return;
-    }
-
-    const char* cur = sections;
-    while (*cur) {
-        uint32_t hash = 0;
-        if (sscanf(cur, "Shader_%08X", &hash) == 1) {
-            HeuristicProfile profile = {};
-            profile.valid = GetPrivateProfileIntA(cur, "Valid", 0, path) != 0;
-            profile.viewBase = GetPrivateProfileIntA(cur, "ViewBase", -1, path);
-            profile.projBase = GetPrivateProfileIntA(cur, "ProjBase", -1, path);
-            profile.layoutMode = GetPrivateProfileIntA(cur, "LayoutMode", Layout_Auto, path);
-            profile.transposed = GetPrivateProfileIntA(cur, "Transposed", 0, path) != 0;
-            profile.inverseView = GetPrivateProfileIntA(cur, "InverseView", 0, path) != 0;
-            if (profile.valid) {
-                g_heuristicProfiles[hash] = profile;
-            }
-        }
-        cur += strlen(cur) + 1;
-    }
 }
 
 static bool TryBuildMatrix4x3FromSnapshot(const ShaderConstantState& state, int baseRegister,
@@ -1396,496 +1296,6 @@ static bool TryBuildMatrixSnapshotInfo(const ShaderConstantState& state, int bas
     }
     return true;
 }
-
-struct CandidateScore {
-    int base = -1;
-    float score = 0.0f;
-    float variance = 0.0f;
-    int strategy = Layout_4x4;
-    bool transposed = false;
-    bool inverseView = false;
-};
-
-struct AutoCandidateKey {
-    uintptr_t shaderKey = 0;
-    int base = -1;
-    int rows = 4;
-    bool transposed = false;
-    MatrixSlot slot = MatrixSlot_View;
-
-    bool operator==(const AutoCandidateKey& other) const {
-        return shaderKey == other.shaderKey &&
-               base == other.base &&
-               rows == other.rows &&
-               transposed == other.transposed &&
-               slot == other.slot;
-    }
-};
-
-struct AutoCandidateKeyHasher {
-    size_t operator()(const AutoCandidateKey& key) const {
-        size_t h = static_cast<size_t>(key.shaderKey);
-        h ^= static_cast<size_t>(key.base + 257) * 16777619u;
-        h ^= static_cast<size_t>(key.rows + 31) * 1099511628211ull;
-        h ^= static_cast<size_t>(key.transposed ? 0x9E3779B1u : 0x7F4A7C15u);
-        h ^= static_cast<size_t>(key.slot) * 0x85EBCA6Bu;
-        return h;
-    }
-};
-
-struct AutoCandidateStats {
-    AutoCandidateKey key = {};
-    unsigned long long seenUpdates = 0;
-    unsigned long long drawCalls = 0;
-    unsigned long long framesWithDraw = 0;
-    int framesSeen = 0;
-    int bestConsecutiveFrames = 0;
-    int consecutiveFrames = 0;
-    int lastSeenFrame = -1000000;
-    int lastDrawFrame = -1000000;
-    float averageFov = 0.0f;
-    int fovSamples = 0;
-    float averageDelta = 0.0f;
-    int deltaSamples = 0;
-    int smoothTransitionCount = 0;
-    D3DMATRIX lastMatrix = {};
-    bool hasLastMatrix = false;
-};
-
-static std::unordered_map<AutoCandidateKey, AutoCandidateStats, AutoCandidateKeyHasher> g_autoCandidateStats = {};
-
-static bool IsAutoDetectActive() {
-    return g_config.autoDetectMatrices;
-}
-
-static void StartAutoDetectSampling() {
-    g_autoCandidateStats.clear();
-    g_autoDetectSamplingStartFrame = g_frameCount;
-    g_autoDetectSamplingActive = true;
-    g_autoDetectSamplingPausedByUser = false;
-}
-
-static void StopAutoDetectSampling() {
-    g_autoDetectSamplingActive = false;
-    g_autoDetectSamplingPausedByUser = true;
-}
-
-static void ResetAutoDetectToLegacyDefaults() {
-    g_runtimeAutoDetectEnabled = false;
-    g_autoApplyDetectedMatrices = false;
-    g_autoDetectMode = AutoDetect_IndividualWVP;
-    g_autoDetectMinFramesSeen = 12;
-    g_autoDetectMinConsecutiveFrames = 4;
-    g_autoDetectSamplingFrames = 180;
-    g_layoutStrategyMode = Layout_Auto;
-    g_probeTransposedLayouts = true;
-    g_probeInverseView = true;
-    g_autoPickCandidates = true;
-    g_autoDetectSamplingStartFrame = -1;
-    g_autoDetectSamplingPausedByUser = false;
-    g_autoCandidateStats.clear();
-    StopAutoDetectSampling();
-
-    g_manualBindings[MatrixSlot_World].enabled = false;
-    g_manualBindings[MatrixSlot_View].enabled = false;
-    g_manualBindings[MatrixSlot_Projection].enabled = false;
-    g_manualBindings[MatrixSlot_MVP].enabled = false;
-
-    g_config.worldMatrixRegister = g_iniWorldMatrixRegister;
-    g_config.viewMatrixRegister = g_iniViewMatrixRegister;
-    g_config.projMatrixRegister = g_iniProjMatrixRegister;
-}
-
-static bool IsAutoDetectSamplingWindowOpen() {
-    if (!g_autoDetectSamplingActive) {
-        return false;
-    }
-    if (g_autoDetectSamplingFrames < 1) {
-        g_autoDetectSamplingFrames = 1;
-    }
-    const int elapsed = g_frameCount - g_autoDetectSamplingStartFrame;
-    if (elapsed >= g_autoDetectSamplingFrames) {
-        g_autoDetectSamplingActive = false;
-        return false;
-    }
-    return true;
-}
-
-static bool IsLikelyOrthographicProjection(const D3DMATRIX& m) {
-    return fabsf(m._34) < 0.2f && fabsf(m._44 - 1.0f) < 0.2f;
-}
-
-static bool PassesPerspectiveHeuristics(const D3DMATRIX& m) {
-    if (IsLikelyOrthographicProjection(m)) {
-        return false;
-    }
-    if (fabsf(m._33) < 0.01f || fabsf(m._43) < 0.0001f) {
-        return false;
-    }
-    float fov = ExtractFOV(m);
-    if (!std::isfinite(fov)) {
-        return false;
-    }
-    return fov >= g_config.minFOV && fov <= g_config.maxFOV;
-}
-
-static void ObserveAutoCandidate(const AutoCandidateKey& key, const D3DMATRIX& mat, float fovRadians = 0.0f) {
-    AutoCandidateStats& stats = g_autoCandidateStats[key];
-    stats.key = key;
-    stats.seenUpdates++;
-    if (stats.lastSeenFrame != g_frameCount) {
-        stats.framesSeen++;
-        if (stats.lastSeenFrame == g_frameCount - 1) {
-            stats.consecutiveFrames++;
-        } else {
-            stats.consecutiveFrames = 1;
-        }
-        stats.bestConsecutiveFrames = (std::max)(stats.bestConsecutiveFrames, stats.consecutiveFrames);
-        stats.lastSeenFrame = g_frameCount;
-    }
-    if (fovRadians > 0.0f && std::isfinite(fovRadians)) {
-        stats.averageFov = (stats.averageFov * static_cast<float>(stats.fovSamples) + fovRadians) /
-                           static_cast<float>(stats.fovSamples + 1);
-        stats.fovSamples++;
-    }
-    if (stats.hasLastMatrix) {
-        const float* prev = reinterpret_cast<const float*>(&stats.lastMatrix);
-        const float* curr = reinterpret_cast<const float*>(&mat);
-        float avgAbsDelta = 0.0f;
-        for (int i = 0; i < 16; i++) {
-            avgAbsDelta += fabsf(curr[i] - prev[i]);
-        }
-        avgAbsDelta /= 16.0f;
-        stats.averageDelta = (stats.averageDelta * static_cast<float>(stats.deltaSamples) + avgAbsDelta) /
-                             static_cast<float>(stats.deltaSamples + 1);
-        stats.deltaSamples++;
-        if (avgAbsDelta < 0.15f) {
-            stats.smoothTransitionCount++;
-        }
-    }
-    stats.lastMatrix = mat;
-    stats.hasLastMatrix = true;
-}
-
-static void RegisterAutoCandidateDraw(const AutoCandidateKey& key) {
-    auto it = g_autoCandidateStats.find(key);
-    if (it == g_autoCandidateStats.end()) {
-        return;
-    }
-    AutoCandidateStats& stats = it->second;
-    stats.drawCalls++;
-    if (stats.lastDrawFrame != g_frameCount) {
-        stats.framesWithDraw++;
-        stats.lastDrawFrame = g_frameCount;
-    }
-}
-
-static bool PassesTemporalStability(const AutoCandidateStats& stats) {
-    return stats.framesSeen >= g_autoDetectMinFramesSeen &&
-           stats.bestConsecutiveFrames >= g_autoDetectMinConsecutiveFrames;
-}
-
-static float ComputeAutoCandidateScore(const AutoCandidateStats& stats) {
-    if (!PassesTemporalStability(stats)) {
-        return -1.0f;
-    }
-    const float smoothnessBonus = static_cast<float>(stats.smoothTransitionCount) * 0.5f;
-    const float deltaPenalty = stats.deltaSamples > 0 ? stats.averageDelta * 2.0f : 0.0f;
-    return static_cast<float>(stats.drawCalls) * 2.2f +
-           static_cast<float>(stats.framesWithDraw) * 1.0f +
-           static_cast<float>(stats.bestConsecutiveFrames) * 0.9f +
-           static_cast<float>(stats.seenUpdates) * 0.04f +
-           smoothnessBonus - deltaPenalty;
-}
-
-static bool FindBestAutoCandidate(MatrixSlot slot, AutoCandidateStats* outStats) {
-    if (!outStats) {
-        return false;
-    }
-    float bestScore = -1.0f;
-    bool found = false;
-    for (const auto& entry : g_autoCandidateStats) {
-        const AutoCandidateStats& stats = entry.second;
-        if (stats.key.slot != slot || !stats.hasLastMatrix) {
-            continue;
-        }
-        float score = ComputeAutoCandidateScore(stats);
-        if (score > bestScore) {
-            bestScore = score;
-            *outStats = stats;
-            found = true;
-        }
-    }
-    return found;
-}
-
-void CreateProjectionMatrix(D3DMATRIX* out, float fovY, float aspect, float zNear, float zFar);
-void ExtractCameraFromMVP(const D3DMATRIX& mvp, D3DMATRIX* viewOut);
-
-static bool ApplyAutoCandidateToLegacyDetection(const AutoCandidateStats& best) {
-    if (!best.hasLastMatrix || best.key.base < 0) {
-        return false;
-    }
-
-    switch (best.key.slot) {
-        case MatrixSlot_World:
-            g_config.worldMatrixRegister = best.key.base;
-            g_manualBindings[MatrixSlot_World].enabled = false;
-            StoreWorldMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
-                             best.key.transposed, false);
-            break;
-        case MatrixSlot_View:
-            g_config.viewMatrixRegister = best.key.base;
-            g_manualBindings[MatrixSlot_View].enabled = false;
-            StoreViewMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
-                            best.key.transposed, false);
-            break;
-        case MatrixSlot_Projection:
-            g_config.projMatrixRegister = best.key.base;
-            g_manualBindings[MatrixSlot_Projection].enabled = false;
-            StoreProjectionMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
-                                  best.key.transposed, false);
-            break;
-        case MatrixSlot_MVP: {
-            StoreMVPMatrix(best.lastMatrix, best.key.shaderKey, best.key.base, best.key.rows,
-                           best.key.transposed, false);
-            D3DMATRIX extractedView = {};
-            D3DMATRIX extractedProj = {};
-            ExtractCameraFromMVP(best.lastMatrix, &extractedView);
-            CreateProjectionMatrix(&extractedProj, 1.047f, 16.0f / 9.0f, 0.1f, 10000.0f);
-            StoreViewMatrix(extractedView, best.key.shaderKey, best.key.base, best.key.rows,
-                            best.key.transposed, false);
-            StoreProjectionMatrix(extractedProj, best.key.shaderKey, best.key.base, best.key.rows,
-                                  best.key.transposed, false);
-            break;
-        }
-        default:
-            return false;
-    }
-    return true;
-}
-
-static float ComputeProjectionLikeScore(const D3DMATRIX& m) {
-    float score = 0.0f;
-    if (fabsf(m._34 - 1.0f) < 0.1f) score += 0.7f;
-    if (fabsf(m._44) < 0.1f) score += 0.5f;
-    if (fabsf(m._11) > 0.01f && fabsf(m._22) > 0.01f) score += 0.4f;
-    return score;
-}
-
-static void CollectTopCandidates(const ShaderConstantState& state,
-                                 std::vector<CandidateScore>* outViewScores,
-                                 std::vector<CandidateScore>* outProjScores) {
-    if (!outViewScores || !outProjScores) {
-        return;
-    }
-    outViewScores->clear();
-    outProjScores->clear();
-
-    for (int base = 0; base < kMaxConstantRegisters; base++) {
-        // 4x4 strategy
-        if (base + 3 < kMaxConstantRegisters) {
-            D3DMATRIX mat = {};
-            bool looksLike = false;
-            bool hasMatrix = TryBuildMatrixSnapshotInfo(state, base, &mat, &looksLike);
-            if (hasMatrix && looksLike) {
-                float variance = 0.0f;
-                for (int reg = base; reg < base + 4; reg++) {
-                    variance += GetVarianceMagnitude(state, reg);
-                }
-                variance /= 4.0f;
-                float varianceScore = variance <= g_config.varianceThreshold ? 1.0f : 0.0f;
-
-                if (LooksLikeViewStrict(mat)) {
-                    outViewScores->push_back({base, 1.0f + varianceScore, variance, Layout_4x4, false, false});
-                    if (g_probeInverseView) {
-                        D3DMATRIX inv = InvertSimpleRigidView(mat);
-                        if (LooksLikeViewStrict(inv)) {
-                            outViewScores->push_back({base, 0.9f + varianceScore, variance, Layout_4x4, false, true});
-                        }
-                    }
-                }
-                if (LooksLikeProjectionStrict(mat)) {
-                    outProjScores->push_back({base, 1.0f + varianceScore, variance, Layout_4x4, false, false});
-                }
-
-                if (g_probeTransposedLayouts) {
-                    D3DMATRIX t = TransposeMatrix(mat);
-                    if (LooksLikeViewStrict(t)) {
-                        outViewScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x4, true, false});
-                    }
-                    if (LooksLikeProjectionStrict(t)) {
-                        outProjScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x4, true, false});
-                    }
-                }
-
-                // VP/WVP heuristics
-                float vpScore = ComputeProjectionLikeScore(mat);
-                if (vpScore > 0.0f) {
-                    outProjScores->push_back({base, 0.5f + vpScore + varianceScore * 0.5f, variance, Layout_VP, false, false});
-                }
-            }
-        }
-
-        // 4x3 strategy
-        if (base + 2 < kMaxConstantRegisters) {
-            for (int transposed = 0; transposed < (g_probeTransposedLayouts ? 2 : 1); transposed++) {
-                D3DMATRIX m43 = {};
-                if (!TryBuildMatrix4x3FromSnapshot(state, base, transposed != 0, &m43)) {
-                    continue;
-                }
-                float variance = 0.0f;
-                for (int reg = base; reg < base + 3; reg++) {
-                    variance += GetVarianceMagnitude(state, reg);
-                }
-                variance /= 3.0f;
-                float varianceScore = variance <= g_config.varianceThreshold ? 1.0f : 0.0f;
-
-                if (LooksLikeViewStrict(m43)) {
-                    outViewScores->push_back({base, 0.95f + varianceScore, variance, Layout_4x3, transposed != 0, false});
-                }
-            }
-        }
-    }
-
-    auto sortScores = [](std::vector<CandidateScore>& scores) {
-        std::sort(scores.begin(), scores.end(),
-                  [](const CandidateScore& a, const CandidateScore& b) {
-                      if (a.score != b.score) {
-                          return a.score > b.score;
-                      }
-                      if (a.variance != b.variance) {
-                          return a.variance < b.variance;
-                      }
-                      return a.base < b.base;
-                  });
-    };
-    sortScores(*outViewScores);
-    sortScores(*outProjScores);
-}
-
-static void LogTopCandidates(const ShaderConstantState& state, uintptr_t shaderKey) {
-    std::vector<CandidateScore> viewScores;
-    std::vector<CandidateScore> projScores;
-    CollectTopCandidates(state, &viewScores, &projScores);
-
-    LogMsg("Candidate summary for shader 0x%p", reinterpret_cast<void*>(shaderKey));
-    int count = 0;
-    for (const auto& entry : viewScores) {
-        LogMsg("  VIEW c%d-c%d score %.2f variance %.6f strategy %d transposed %d inverse %d", entry.base, entry.base + 3,
-               entry.score, entry.variance, entry.strategy, entry.transposed ? 1 : 0, entry.inverseView ? 1 : 0);
-        if (++count >= g_config.topCandidateCount) {
-            break;
-        }
-    }
-    count = 0;
-    for (const auto& entry : projScores) {
-        LogMsg("  PROJ c%d-c%d score %.2f variance %.6f strategy %d transposed %d", entry.base, entry.base + 3,
-               entry.score, entry.variance, entry.strategy, entry.transposed ? 1 : 0);
-        if (++count >= g_config.topCandidateCount) {
-            break;
-        }
-    }
-}
-
-static void UpdateStability(ShaderConstantState& state, int base, bool isView, bool isProj) {
-    if (isView) {
-        if (state.stableViewBase == base) {
-            state.stableViewCount++;
-        } else {
-            state.stableViewBase = base;
-            state.stableViewCount = 1;
-        }
-        if (state.stableViewCount == g_config.stabilityFrames) {
-            LogMsg("Stable VIEW candidate: c%d-c%d", base, base + 3);
-        }
-    }
-    if (isProj) {
-        if (state.stableProjBase == base) {
-            state.stableProjCount++;
-        } else {
-            state.stableProjBase = base;
-            state.stableProjCount = 1;
-        }
-        if (state.stableProjCount == g_config.stabilityFrames) {
-            LogMsg("Stable PROJ candidate: c%d-c%d", base, base + 3);
-        }
-    }
-}
-
-static bool TryPromoteStableAutoCandidate(ShaderConstantState& state,
-                                          MatrixSlot slot,
-                                          uintptr_t shaderKey,
-                                          int base,
-                                          int rows,
-                                          bool transposed,
-                                          const D3DMATRIX& mat) {
-    if (!IsAutoDetectActive()) {
-        return false;
-    }
-
-    const bool viewStable = slot == MatrixSlot_View &&
-                            state.stableViewBase == base &&
-                            state.stableViewCount >= g_config.stabilityFrames;
-    const bool projStable = slot == MatrixSlot_Projection &&
-                            state.stableProjBase == base &&
-                            state.stableProjCount >= g_config.stabilityFrames;
-
-    if (!viewStable && !projStable) {
-        return false;
-    }
-
-    uint32_t shaderHash = 0;
-    const bool hasShaderHash = TryGetShaderBytecodeHash(shaderKey, &shaderHash);
-    HeuristicProfile* profile = nullptr;
-    if (hasShaderHash) {
-        profile = &g_heuristicProfiles[shaderHash];
-        if (profile->valid) {
-            if (slot == MatrixSlot_View && profile->viewBase >= 0 && profile->viewBase != base) {
-                return false;
-            }
-            if (slot == MatrixSlot_Projection && profile->projBase >= 0 && profile->projBase != base) {
-                return false;
-            }
-        }
-    }
-
-    if (slot == MatrixSlot_View && g_config.viewMatrixRegister != base) {
-        g_config.viewMatrixRegister = base;
-        g_manualBindings[MatrixSlot_View].enabled = false;
-        StoreViewMatrix(mat, shaderKey, base, rows, transposed, false, "auto-detect stable candidate");
-        LogMsg("AutoDetect refined: promoted stable VIEW matrix c%d-c%d (rows=%d transpose=%d)",
-               base, base + rows - 1, rows, transposed ? 1 : 0);
-        if (profile) {
-            profile->valid = true;
-            profile->viewBase = base;
-            profile->layoutMode = g_layoutStrategyMode;
-            profile->transposed = g_probeTransposedLayouts;
-            profile->inverseView = g_probeInverseView;
-            SaveHeuristicProfile(shaderHash, *profile);
-        }
-        return true;
-    }
-    if (slot == MatrixSlot_Projection && g_config.projMatrixRegister != base) {
-        g_config.projMatrixRegister = base;
-        g_manualBindings[MatrixSlot_Projection].enabled = false;
-        StoreProjectionMatrix(mat, shaderKey, base, rows, transposed, false, "auto-detect stable candidate");
-        float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
-        LogMsg("AutoDetect refined: promoted stable PROJECTION matrix c%d-c%d (rows=%d transpose=%d FOV %.1f)",
-               base, base + rows - 1, rows, transposed ? 1 : 0, fov);
-        if (profile) {
-            profile->valid = true;
-            profile->projBase = base;
-            profile->layoutMode = g_layoutStrategyMode;
-            profile->transposed = g_probeTransposedLayouts;
-            profile->inverseView = g_probeInverseView;
-            SaveHeuristicProfile(shaderHash, *profile);
-        }
-        return true;
-    }
-    return false;
-}
-
 
 static void ScanBuffer(const void* base, size_t size, int& resultsFound) {
     if (!base || size < sizeof(D3DMATRIX)) {
@@ -2482,93 +1892,6 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("<no constants captured yet>");
             }
             ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Heuristics")) {
-            ImGui::Text("Refined legacy matrix auto-detection (deterministic)");
-            ImGui::Text("AutoDetectMatrices (camera_proxy.ini): %s", g_config.autoDetectMatrices ? "ON" : "OFF");
-            ImGui::TextWrapped("This tab is runtime heuristics only. To enable/disable auto-detect, keep using AutoDetectMatrices in camera_proxy.ini.");
-            static const char* kLayoutModes[] = {"Auto", "4x4", "4x3", "VP", "MVP"};
-            ImGui::Combo("Layout strategy", &g_layoutStrategyMode, kLayoutModes, IM_ARRAYSIZE(kLayoutModes));
-            ImGui::Checkbox("Probe transposed layouts", &g_probeTransposedLayouts);
-            ImGui::Checkbox("Probe inverse-view candidates", &g_probeInverseView);
-            ImGui::InputInt("Stability frames", &g_config.stabilityFrames);
-            if (g_config.stabilityFrames < 1) g_config.stabilityFrames = 1;
-
-            ImGui::Separator();
-            ImGui::TextWrapped("Stable candidates are persisted by shader hash once promoted, preventing register hopping between unrelated transform sets.");
-
-            ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
-            if (state) {
-                ImGui::Text("Stable VIEW candidate: %s", state->stableViewBase >= 0 ? "yes" : "no");
-                if (state->stableViewBase >= 0) {
-                    ImGui::Text("  c%d (count=%d)", state->stableViewBase, state->stableViewCount);
-                }
-                ImGui::Text("Stable PROJECTION candidate: %s", state->stableProjBase >= 0 ? "yes" : "no");
-                if (state->stableProjBase >= 0) {
-                    ImGui::Text("  c%d (count=%d)", state->stableProjBase, state->stableProjCount);
-                }
-
-                std::vector<CandidateScore> viewScores;
-                std::vector<CandidateScore> projScores;
-                CollectTopCandidates(*state, &viewScores, &projScores);
-
-                ImGui::Separator();
-                ImGui::Text("Top VIEW candidates");
-                int viewCount = (std::min)(g_config.topCandidateCount, static_cast<int>(viewScores.size()));
-                if (viewCount == 0) {
-                    ImGui::Text("  <none>");
-                }
-                for (int i = 0; i < viewCount; ++i) {
-                    const CandidateScore& entry = viewScores[i];
-                    ImGui::Text("  #%d c%d-c%d score=%.2f var=%.5f transposed=%d inverse=%d",
-                                i + 1, entry.base, entry.base + 3, entry.score, entry.variance,
-                                entry.transposed ? 1 : 0, entry.inverseView ? 1 : 0);
-                }
-
-                ImGui::Text("Top PROJECTION candidates");
-                int projCount = (std::min)(g_config.topCandidateCount, static_cast<int>(projScores.size()));
-                if (projCount == 0) {
-                    ImGui::Text("  <none>");
-                }
-                for (int i = 0; i < projCount; ++i) {
-                    const CandidateScore& entry = projScores[i];
-                    ImGui::Text("  #%d c%d-c%d score=%.2f var=%.5f transposed=%d",
-                                i + 1, entry.base, entry.base + 3, entry.score, entry.variance,
-                                entry.transposed ? 1 : 0);
-                }
-            }
-
-            uint32_t selectedShaderHash = 0;
-            if (TryGetShaderBytecodeHash(g_selectedShaderKey, &selectedShaderHash)) {
-                HeuristicProfile* profile = nullptr;
-                auto profileIt = g_heuristicProfiles.find(selectedShaderHash);
-                if (profileIt != g_heuristicProfiles.end()) {
-                    profile = &profileIt->second;
-                }
-                const bool hasProfile = profile && profile->valid;
-                ImGui::Separator();
-                ImGui::Text("Selected shader hash: 0x%08X", selectedShaderHash);
-                ImGui::Text("Persisted VIEW pin: %s", (hasProfile && profile->viewBase >= 0) ? "yes" : "no");
-                if (hasProfile && profile->viewBase >= 0) {
-                    ImGui::SameLine();
-                    ImGui::Text("c%d", profile->viewBase);
-                }
-                ImGui::Text("Persisted PROJECTION pin: %s", (hasProfile && profile->projBase >= 0) ? "yes" : "no");
-                if (hasProfile && profile->projBase >= 0) {
-                    ImGui::SameLine();
-                    ImGui::Text("c%d", profile->projBase);
-                }
-                if (ImGui::Button("Clear selected shader heuristic profile")) {
-                    HeuristicProfile cleared = {};
-                    SaveHeuristicProfile(selectedShaderHash, cleared);
-                    g_heuristicProfiles.erase(selectedShaderHash);
-                    LogMsg("Cleared heuristic profile for shader hash 0x%08X", selectedShaderHash);
-                }
-            } else {
-                ImGui::Text("Selected shader hash: <not available yet>");
-            }
             ImGui::EndTabItem();
         }
 
@@ -3206,7 +2529,7 @@ public:
             g_profileDisableStructuralDetection = true;
             // MGR strict known-layout mode:
             // - capture only c4-c7 projection, c12-c15 viewInverse (invert once), c16-c19 world
-            // - do not run structural detection, heuristic fallback, or candidate scanning
+            // - do not run structural detection fallback or candidate scanning
             // - persist projection/view across draws until overwritten by the same known registers
             auto tryExtractMgrMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
                 if (!outMat || !effectiveConstantData || baseRegister < 0) {
@@ -3537,47 +2860,18 @@ public:
                     }
 
                     MatrixClassification finalClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                    if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
+                        D3DMATRIX inverseView = InvertSimpleRigidView(mat);
+                        MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                        if (inverseClass == MatrixClass_View) {
+                            mat = inverseView;
+                            finalClass = inverseClass;
+                        }
+                    }
                     if (finalClass != MatrixClass_None) {
                         anyStructuralMatch = true;
                         updateFromClassification(mat, baseReg, static_cast<int>(rows), transposed);
                     }
-                }
-            }
-        }
-
-        const bool allowLegacyHeuristics = allowStructuralDetection && g_config.autoDetectMatrices && !anyStructuralMatch &&
-                                           g_config.worldMatrixRegister < 0 &&
-                                           g_config.viewMatrixRegister < 0 &&
-                                           g_config.projMatrixRegister < 0;
-        if (allowLegacyHeuristics && state) {
-            std::vector<CandidateScore> viewScores;
-            std::vector<CandidateScore> projScores;
-            CollectTopCandidates(*state, &viewScores, &projScores);
-
-            if (!slotResolvedByOverride[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_View] && !viewScores.empty()) {
-                const CandidateScore& top = viewScores.front();
-                D3DMATRIX view = {};
-                if (TryBuildMatrixSnapshot(*state, top.base, (top.strategy == Layout_4x3) ? 3 : 4,
-                                           top.transposed, &view) && LooksLikeViewStrict(view)) {
-                    m_currentView = view;
-                    m_hasView = true;
-                    StoreViewMatrix(m_currentView, shaderKey, top.base, (top.strategy == Layout_4x3) ? 3 : 4,
-                                    top.transposed, false, "legacy heuristic fallback view");
-                }
-            }
-
-            if (!slotResolvedByOverride[MatrixSlot_Projection] && !slotResolvedStructurally[MatrixSlot_Projection] && !projScores.empty()) {
-                const CandidateScore& top = projScores.front();
-                D3DMATRIX proj = {};
-                if (TryBuildMatrixSnapshot(*state, top.base, 4, top.transposed, &proj) && LooksLikeProjectionStrict(proj)) {
-                    m_currentProj = proj;
-                    m_hasProj = true;
-                    g_projectionDetectedByNumericStructure = false;
-                    g_projectionDetectedRegister = top.base;
-                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-                    g_projectionDetectedFovRadians = ExtractFOV(proj);
-                    StoreProjectionMatrix(m_currentProj, shaderKey, top.base, 4,
-                                          top.transposed, false, "legacy heuristic fallback projection");
                 }
             }
         }
@@ -3618,12 +2912,6 @@ public:
         // Log periodic status
         if (g_frameCount % 300 == 0) {
             LogMsg("Frame %d - hasView: %d, hasProj: %d", g_frameCount, m_hasView, m_hasProj);
-            if (g_config.logCandidateSummary && g_activeGameProfile != GameProfile_MetalGearRising) {
-                ShaderConstantState* state = GetShaderState(g_activeShaderKey, false);
-                if (state) {
-                    LogTopCandidates(*state, g_activeShaderKey);
-                }
-            }
         }
 
         if (!g_imguiInitialized) {
@@ -4035,11 +3323,6 @@ void LoadConfig() {
     g_config.enableLogging = GetPrivateProfileIntA("CameraProxy", "EnableLogging", 1, path) != 0;
     g_config.logAllConstants = GetPrivateProfileIntA("CameraProxy", "LogAllConstants", 0, path) != 0;
     g_config.autoDetectMatrices = GetPrivateProfileIntA("CameraProxy", "AutoDetectMatrices", 0, path) != 0;
-    g_config.stabilityFrames = GetPrivateProfileIntA("CameraProxy", "StabilityFrames", 5, path);
-    g_config.varianceThreshold = static_cast<float>(
-        GetPrivateProfileIntA("CameraProxy", "VarianceThresholdMilli", 3, path)) / 1000.0f;
-    g_config.topCandidateCount = GetPrivateProfileIntA("CameraProxy", "TopCandidateCount", 5, path);
-    g_config.logCandidateSummary = GetPrivateProfileIntA("CameraProxy", "LogCandidateSummary", 1, path) != 0;
     g_config.enableMemoryScanner = GetPrivateProfileIntA("CameraProxy", "EnableMemoryScanner", 0, path) != 0;
     g_config.memoryScannerIntervalSec = GetPrivateProfileIntA("CameraProxy", "MemoryScannerIntervalSec", 0, path);
     g_config.memoryScannerMaxResults = GetPrivateProfileIntA("CameraProxy", "MemoryScannerMaxResults", 25, path);
@@ -4086,17 +3369,10 @@ void LoadConfig() {
     if (g_config.imguiScale > 3.0f) g_config.imguiScale = 3.0f;
     GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
                              MAX_PATH, path);
-    g_layoutStrategyMode = GetPrivateProfileIntA("CameraProxy", "LayoutStrategyMode", Layout_Auto, path);
     g_probeTransposedLayouts = GetPrivateProfileIntA("CameraProxy", "ProbeTransposedLayouts", 1, path) != 0;
     g_probeInverseView = GetPrivateProfileIntA("CameraProxy", "ProbeInverseView", 1, path) != 0;
-    g_autoPickCandidates = GetPrivateProfileIntA("CameraProxy", "AutoPickCandidates", 1, path) != 0;
     g_overrideScopeMode = GetPrivateProfileIntA("CameraProxy", "OverrideScopeMode", Override_Sticky, path);
     g_overrideNFrames = GetPrivateProfileIntA("CameraProxy", "OverrideNFrames", 3, path);
-    g_autoDetectMode = GetPrivateProfileIntA("CameraProxy", "AutoDetectMode", AutoDetect_IndividualWVP, path);
-    g_autoDetectMinFramesSeen = GetPrivateProfileIntA("CameraProxy", "AutoDetectMinFramesSeen", 12, path);
-    g_autoDetectMinConsecutiveFrames = GetPrivateProfileIntA("CameraProxy", "AutoDetectMinConsecutiveFrames", 4, path);
-    g_autoDetectSamplingFrames = GetPrivateProfileIntA("CameraProxy", "AutoDetectSamplingFrames", 180, path);
-    g_autoApplyDetectedMatrices = GetPrivateProfileIntA("CameraProxy", "AutoApplyDetectedMatrices", 1, path) != 0;
     g_config.hotkeyToggleMenuVk = GetPrivateProfileIntA("CameraProxy", "HotkeyToggleMenuVK", VK_F10, path);
     g_config.hotkeyTogglePauseVk = GetPrivateProfileIntA("CameraProxy", "HotkeyTogglePauseVK", VK_F9, path);
     g_config.hotkeyEmitMatricesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyEmitMatricesVK", VK_F8, path);
@@ -4115,7 +3391,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
 
         LoadConfig();
-        LoadHeuristicProfiles();
 
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
@@ -4134,9 +3409,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             }
             LogMsg("Auto-detect matrices: %s", g_config.autoDetectMatrices ? "ENABLED" : "disabled");
             LogMsg("Log all constants: %s", g_config.logAllConstants ? "ENABLED" : "disabled");
-            LogMsg("Stability frames: %d", g_config.stabilityFrames);
-            LogMsg("Variance threshold: %.4f", g_config.varianceThreshold);
-            LogMsg("Candidate summary: %s", g_config.logCandidateSummary ? "ENABLED" : "disabled");
             LogMsg("Memory scanner: %s", g_config.enableMemoryScanner ? "ENABLED" : "disabled");
             LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
             LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
@@ -4156,14 +3428,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                 }
             }
             LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
-            LogMsg("Layout strategy mode: %d", g_layoutStrategyMode);
             LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");
             LogMsg("Probe inverse view: %s", g_probeInverseView ? "ENABLED" : "disabled");
             LogMsg("Override scope mode: %d (N=%d)", g_overrideScopeMode, g_overrideNFrames);
-            LogMsg("Auto detect mode: %d, min frames=%d, min streak=%d",
-                   g_autoDetectMode, g_autoDetectMinFramesSeen, g_autoDetectMinConsecutiveFrames);
-            LogMsg("Auto detect legacy compatibility keys: samplingFrames=%d autoApply=%s (not used by refined detector)",
-                   g_autoDetectSamplingFrames, g_autoApplyDetectedMatrices ? "ENABLED" : "disabled");
             LogMsg("Hotkeys (VK): menu=%d pause=%d emit=%d resetOverrides=%d",
                    g_config.hotkeyToggleMenuVk,
                    g_config.hotkeyTogglePauseVk,

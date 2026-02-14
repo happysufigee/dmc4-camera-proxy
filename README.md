@@ -108,7 +108,7 @@ To support titles where ImGui input is unreliable, single-key hotkeys are polled
 - `HotkeyEmitMatricesVK` (default F8)
 - `HotkeyResetMatrixOverridesVK` (default F7)
 
-Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to heuristic candidate selection.
+Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to deterministic structural auto-detection.
 
 ---
 
@@ -148,6 +148,7 @@ See `camera_proxy.ini` for full comments. Most important keys:
 - `WorldMatrixRegister`
 - `AutoDetectMatrices`
 - `ProbeTransposedLayouts`
+- `ProbeInverseView`
 - `ImGuiScalePercent`
 - `EnableLogging`
 - `GameProfile`
@@ -156,13 +157,12 @@ See `camera_proxy.ini` for full comments. Most important keys:
 
 - **Camera**: live World/View/Projection/MVP display and source metadata.
 - **Constants**: captured registers and shader-constant editing tools.
-- **Heuristics / diagnostics tabs**: legacy/experimental controls retained for compatibility work.
+- **Memory Scanner**: optional background memory scan controls and matrix assignment actions.
 - **Logs**: in-overlay log stream.
 
 ## Notes
 
 - This is an **experimental branch** intended for iterative engine compatibility testing.
-- Some legacy keys and panels are still present for compatibility/debugging even though deterministic matrix classification is the primary path.
 
 ## Credits
 

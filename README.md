@@ -47,13 +47,28 @@ If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once 
 - `>= 0` means only that base register is accepted for that type.
 - `-1` means classify from all observed constant ranges.
 
-### 5) Draw-time emission
+### 5) Game profiles (Metal Gear Rising)
+
+You can enable a fixed register profile via `camera_proxy.ini`:
+
+- `GameProfile=MetalGearRising`
+
+When active, the proxy prioritizes the known MGR:R layout:
+
+- `c4-c7`   → Projection
+- `c12-c15` → View Inverse (inverted deterministically to derive View)
+- `c16-c19` → World
+- optional tracking only: `c8-c11` (ViewProjection), `c20-c23` (WorldView)
+
+For this profile path, matrix extraction avoids heuristic ranking for core W/V/P when expected registers are seen. If expected profile uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
+
+### 6) Draw-time emission
 
 When `EmitFixedFunctionTransforms=1`, cached WORLD/VIEW/PROJECTION are emitted before each intercepted draw call.
 
 If a matrix type is unknown, identity is used as fallback to keep fixed-function state valid.
 
-### 6) ImGui overlay scaling
+### 7) ImGui overlay scaling
 
 This branch includes configurable UI scaling:
 
@@ -63,7 +78,7 @@ This branch includes configurable UI scaling:
 Scaling is applied to both style metrics and fonts.
 
 
-### 7) Input compatibility and hotkeys
+### 8) Input compatibility and hotkeys
 
 To support titles where ImGui input is unreliable, single-key hotkeys are polled every frame and can drive core actions even with the overlay hidden:
 
@@ -114,6 +129,7 @@ See `camera_proxy.ini` for full comments. Most important keys:
 - `ProbeTransposedLayouts`
 - `ImGuiScalePercent`
 - `EnableLogging`
+- `GameProfile`
 
 ## Overlay overview
 

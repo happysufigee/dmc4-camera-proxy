@@ -25,6 +25,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <cassert>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -81,6 +82,7 @@ struct ProxyConfig {
     bool useRemixRuntime = true;
     char remixDllName[MAX_PATH] = "d3d9_remix.dll";
     bool emitFixedFunctionTransforms = true;
+    char gameProfile[64] = "";
 
     // Diagnostic mode - log ALL shader constant updates
     bool logAllConstants = false;
@@ -91,6 +93,26 @@ struct ProxyConfig {
     int hotkeyEmitMatricesVk = VK_F8;
     int hotkeyResetMatrixOverridesVk = VK_F7;
 };
+
+enum GameProfileKind {
+    GameProfile_None = 0,
+    GameProfile_MetalGearRising
+};
+
+struct RegisterLayoutProfile {
+    int projectionBase = -1;
+    int viewInverseBase = -1;
+    int worldBase = -1;
+    int viewProjectionBase = -1;
+    int worldViewBase = -1;
+};
+
+static GameProfileKind g_activeGameProfile = GameProfile_None;
+static RegisterLayoutProfile g_profileLayout = {};
+static bool g_profileViewDerivedFromInverse = false;
+static bool g_profileCoreRegistersSeen[3] = { false, false, false }; // proj, viewInv, world
+static bool g_profileOptionalRegistersSeen[2] = { false, false }; // VP, WV
+static char g_profileStatusMessage[256] = "";
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -975,6 +997,174 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
     out._42 = -(view._41 * out._12 + view._42 * out._22 + view._43 * out._32);
     out._43 = -(view._41 * out._13 + view._42 * out._23 + view._43 * out._33);
     return out;
+}
+
+static const char* GameProfileLabel(GameProfileKind profile) {
+    switch (profile) {
+        case GameProfile_MetalGearRising: return "MetalGearRising";
+        case GameProfile_None:
+        default:
+            return "None";
+    }
+}
+
+static GameProfileKind ParseGameProfile(const char* profileName) {
+    if (!profileName || profileName[0] == '\0') {
+        return GameProfile_None;
+    }
+    if (_stricmp(profileName, "MetalGearRising") == 0 ||
+        _stricmp(profileName, "MGR") == 0 ||
+        _stricmp(profileName, "MetalGearRisingRevengeance") == 0) {
+        return GameProfile_MetalGearRising;
+    }
+    return GameProfile_None;
+}
+
+static void ConfigureActiveProfileLayout() {
+    g_profileLayout = {};
+    if (g_activeGameProfile == GameProfile_MetalGearRising) {
+        g_profileLayout.projectionBase = 4;
+        g_profileLayout.viewProjectionBase = 8;
+        g_profileLayout.viewInverseBase = 12;
+        g_profileLayout.worldBase = 16;
+        g_profileLayout.worldViewBase = 20;
+    }
+}
+
+static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr) {
+    if (!out) {
+        return false;
+    }
+
+    const float* m = reinterpret_cast<const float*>(&in);
+    float inv[16] = {};
+
+    inv[0] = m[5]  * m[10] * m[15] -
+             m[5]  * m[11] * m[14] -
+             m[9]  * m[6]  * m[15] +
+             m[9]  * m[7]  * m[14] +
+             m[13] * m[6]  * m[11] -
+             m[13] * m[7]  * m[10];
+
+    inv[4] = -m[4]  * m[10] * m[15] +
+              m[4]  * m[11] * m[14] +
+              m[8]  * m[6]  * m[15] -
+              m[8]  * m[7]  * m[14] -
+              m[12] * m[6]  * m[11] +
+              m[12] * m[7]  * m[10];
+
+    inv[8] = m[4]  * m[9] * m[15] -
+             m[4]  * m[11] * m[13] -
+             m[8]  * m[5] * m[15] +
+             m[8]  * m[7] * m[13] +
+             m[12] * m[5] * m[11] -
+             m[12] * m[7] * m[9];
+
+    inv[12] = -m[4]  * m[9] * m[14] +
+               m[4]  * m[10] * m[13] +
+               m[8]  * m[5] * m[14] -
+               m[8]  * m[6] * m[13] -
+               m[12] * m[5] * m[10] +
+               m[12] * m[6] * m[9];
+
+    inv[1] = -m[1]  * m[10] * m[15] +
+              m[1]  * m[11] * m[14] +
+              m[9]  * m[2] * m[15] -
+              m[9]  * m[3] * m[14] -
+              m[13] * m[2] * m[11] +
+              m[13] * m[3] * m[10];
+
+    inv[5] = m[0]  * m[10] * m[15] -
+             m[0]  * m[11] * m[14] -
+             m[8]  * m[2] * m[15] +
+             m[8]  * m[3] * m[14] +
+             m[12] * m[2] * m[11] -
+             m[12] * m[3] * m[10];
+
+    inv[9] = -m[0]  * m[9] * m[15] +
+              m[0]  * m[11] * m[13] +
+              m[8]  * m[1] * m[15] -
+              m[8]  * m[3] * m[13] -
+              m[12] * m[1] * m[11] +
+              m[12] * m[3] * m[9];
+
+    inv[13] = m[0]  * m[9] * m[14] -
+              m[0]  * m[10] * m[13] -
+              m[8]  * m[1] * m[14] +
+              m[8]  * m[2] * m[13] +
+              m[12] * m[1] * m[10] -
+              m[12] * m[2] * m[9];
+
+    inv[2] = m[1]  * m[6] * m[15] -
+             m[1]  * m[7] * m[14] -
+             m[5]  * m[2] * m[15] +
+             m[5]  * m[3] * m[14] +
+             m[13] * m[2] * m[7] -
+             m[13] * m[3] * m[6];
+
+    inv[6] = -m[0]  * m[6] * m[15] +
+              m[0]  * m[7] * m[14] +
+              m[4]  * m[2] * m[15] -
+              m[4]  * m[3] * m[14] -
+              m[12] * m[2] * m[7] +
+              m[12] * m[3] * m[6];
+
+    inv[10] = m[0]  * m[5] * m[15] -
+              m[0]  * m[7] * m[13] -
+              m[4]  * m[1] * m[15] +
+              m[4]  * m[3] * m[13] +
+              m[12] * m[1] * m[7] -
+              m[12] * m[3] * m[5];
+
+    inv[14] = -m[0]  * m[5] * m[14] +
+               m[0]  * m[6] * m[13] +
+               m[4]  * m[1] * m[14] -
+               m[4]  * m[2] * m[13] -
+               m[12] * m[1] * m[6] +
+               m[12] * m[2] * m[5];
+
+    inv[3] = -m[1] * m[6] * m[11] +
+              m[1] * m[7] * m[10] +
+              m[5] * m[2] * m[11] -
+              m[5] * m[3] * m[10] -
+              m[9] * m[2] * m[7] +
+              m[9] * m[3] * m[6];
+
+    inv[7] = m[0] * m[6] * m[11] -
+             m[0] * m[7] * m[10] -
+             m[4] * m[2] * m[11] +
+             m[4] * m[3] * m[10] +
+             m[8] * m[2] * m[7] -
+             m[8] * m[3] * m[6];
+
+    inv[11] = -m[0] * m[5] * m[11] +
+               m[0] * m[7] * m[9] +
+               m[4] * m[1] * m[11] -
+               m[4] * m[3] * m[9] -
+               m[8] * m[1] * m[7] +
+               m[8] * m[3] * m[5];
+
+    inv[15] = m[0] * m[5] * m[10] -
+              m[0] * m[6] * m[9] -
+              m[4] * m[1] * m[10] +
+              m[4] * m[2] * m[9] +
+              m[8] * m[1] * m[6] -
+              m[8] * m[2] * m[5];
+
+    float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (outDeterminant) {
+        *outDeterminant = det;
+    }
+    if (fabsf(det) <= 1e-8f) {
+        return false;
+    }
+
+    const float detInv = 1.0f / det;
+    float* dst = reinterpret_cast<float*>(out);
+    for (int i = 0; i < 16; i++) {
+        dst[i] = inv[i] * detInv;
+    }
+    return true;
 }
 
 static void ClearAllShaderOverrides() {
@@ -1924,6 +2114,23 @@ static void RenderImGuiOverlay() {
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
         if (ImGui::BeginTabItem("Camera")) {
+            ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
+            if (g_activeGameProfile == GameProfile_MetalGearRising) {
+                ImGui::Text("MGR layout: Proj=c4-c7, ViewInverse=c12-c15, World=c16-c19");
+                ImGui::Text("Optional combined: ViewProjection=c8-c11, WorldView=c20-c23");
+                ImGui::Text("Core seen: Proj=%s ViewInv=%s World=%s",
+                            g_profileCoreRegistersSeen[0] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[1] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[2] ? "yes" : "no");
+                ImGui::Text("Optional seen: ViewProjection=%s WorldView=%s",
+                            g_profileOptionalRegistersSeen[0] ? "yes" : "no",
+                            g_profileOptionalRegistersSeen[1] ? "yes" : "no");
+                ImGui::Text("View source: %s", g_profileViewDerivedFromInverse ? "Derived by inversion" : "Not yet derived");
+                if (g_profileStatusMessage[0] != '\0') {
+                    ImGui::TextWrapped("%s", g_profileStatusMessage);
+                }
+            }
+            ImGui::Separator();
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.hasWorld);
@@ -2892,7 +3099,85 @@ public:
             }
         }
 
+        const bool profileActive = g_activeGameProfile == GameProfile_MetalGearRising;
+        bool profileHardFailure = false;
+        bool profileMatchedKnownConstants = false;
+
+        auto tryExtractProfileMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
+            if (!outMat || !effectiveConstantData || baseRegister < 0) {
+                return false;
+            }
+            return TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                    baseRegister, 4, false, outMat);
+        };
+
+        if (profileActive) {
+            D3DMATRIX mat = {};
+            if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
+                profileMatchedKnownConstants = true;
+                m_currentProj = mat;
+                m_hasProj = true;
+                slotResolvedByOverride[MatrixSlot_Projection] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = g_profileLayout.projectionBase;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(mat);
+                g_profileCoreRegistersSeen[0] = true;
+                StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.projectionBase, 4, false, true,
+                                      "MetalGearRising profile projection (c4-c7)");
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.worldBase, &mat)) {
+                profileMatchedKnownConstants = true;
+                m_currentWorld = mat;
+                m_hasWorld = true;
+                slotResolvedByOverride[MatrixSlot_World] = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 4, false, true,
+                                 "MetalGearRising profile world (c16-c19)");
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
+                profileMatchedKnownConstants = true;
+                g_profileCoreRegistersSeen[1] = true;
+                float determinant = 0.0f;
+                D3DMATRIX derivedView = {};
+                if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
+                    assert(fabsf(determinant) > 1e-8f && "MGR viewInverse determinant should be non-zero");
+                    m_currentView = derivedView;
+                    m_hasView = true;
+                    slotResolvedByOverride[MatrixSlot_View] = true;
+                    g_profileViewDerivedFromInverse = true;
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "View derived from c12-c15 inverse matrix (det=%.6f).", determinant);
+                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewInverseBase, 4, false, true,
+                                    "MetalGearRising profile view derived from inverse", g_profileLayout.viewInverseBase);
+                    LogMsg("MGR profile: derived View by inverting c12-c15 (det=%.6f)", determinant);
+                } else {
+                    profileHardFailure = true;
+                    g_profileViewDerivedFromInverse = false;
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "WARNING: Failed to invert c12-c15 viewInverse (det=%.9f). Falling back to structural detection.",
+                             determinant);
+                    LogMsg("WARNING: MGR profile inversion failed for c12-c15 (det=%.9f); structural fallback enabled.", determinant);
+                }
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.viewProjectionBase, &mat)) {
+                g_profileOptionalRegistersSeen[0] = true;
+                StoreMVPMatrix(mat, shaderKey, g_profileLayout.viewProjectionBase, 4, false, false,
+                               "MetalGearRising profile optional viewProjection (c8-c11)");
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.worldViewBase, &mat)) {
+                g_profileOptionalRegistersSeen[1] = true;
+            }
+        }
+
         auto tryExplicitRegisterOverride = [&](MatrixSlot slot, int configuredRegister) {
+            if (profileActive) {
+                return;
+            }
             if (configuredRegister < 0 || !effectiveConstantData) {
                 return;
             }
@@ -2987,8 +3272,14 @@ public:
             }
         };
 
+        if (profileActive && !profileMatchedKnownConstants && !profileHardFailure) {
+            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                     "MGR profile active but this upload did not hit c4-c7/c12-c15/c16-c19; structural fallback used.");
+        }
+
+        const bool allowStructuralDetection = !profileActive || profileHardFailure || !profileMatchedKnownConstants;
         bool anyStructuralMatch = false;
-        if (effectiveConstantData && Vector4fCount >= 3) {
+        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
             for (UINT rows : {4u, 3u}) {
                 if (Vector4fCount < rows) {
                     continue;
@@ -3022,7 +3313,7 @@ public:
             }
         }
 
-        const bool allowLegacyHeuristics = g_config.autoDetectMatrices && !anyStructuralMatch &&
+        const bool allowLegacyHeuristics = allowStructuralDetection && g_config.autoDetectMatrices && !anyStructuralMatch &&
                                            g_config.worldMatrixRegister < 0 &&
                                            g_config.viewMatrixRegister < 0 &&
                                            g_config.projMatrixRegister < 0;
@@ -3511,6 +3802,18 @@ void LoadConfig() {
                              MAX_PATH, path);
     g_config.useRemixRuntime = GetPrivateProfileIntA("CameraProxy", "UseRemixRuntime", 1, path) != 0;
     g_config.emitFixedFunctionTransforms = GetPrivateProfileIntA("CameraProxy", "EmitFixedFunctionTransforms", 1, path) != 0;
+    GetPrivateProfileStringA("CameraProxy", "GameProfile", "", g_config.gameProfile,
+                             static_cast<DWORD>(sizeof(g_config.gameProfile)), path);
+    g_activeGameProfile = ParseGameProfile(g_config.gameProfile);
+    ConfigureActiveProfileLayout();
+    g_profileCoreRegistersSeen[0] = g_profileCoreRegistersSeen[1] = g_profileCoreRegistersSeen[2] = false;
+    g_profileOptionalRegistersSeen[0] = g_profileOptionalRegistersSeen[1] = false;
+    g_profileViewDerivedFromInverse = false;
+    g_profileStatusMessage[0] = '\0';
+    if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
+        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                 "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
+    }
     g_config.imguiScale = GetPrivateProfileIntA("CameraProxy", "ImGuiScalePercent", 100, path) / 100.0f;
     if (g_config.imguiScale < 0.5f) g_config.imguiScale = 0.5f;
     if (g_config.imguiScale > 3.0f) g_config.imguiScale = 3.0f;
@@ -3571,6 +3874,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
             LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
             LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
+            LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
             LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
             LogMsg("Layout strategy mode: %d", g_layoutStrategyMode);
             LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");

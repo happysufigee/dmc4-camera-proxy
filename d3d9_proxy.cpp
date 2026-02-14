@@ -131,17 +131,16 @@ struct CombinedMVPDebugState {
 enum GameProfileKind {
     GameProfile_None = 0,
     GameProfile_MetalGearRising,
-    GameProfile_Barnyard2006
+    GameProfile_DevilMayCry4
 };
 
 struct RegisterLayoutProfile {
+    int combinedMvpBase = -1;
     int projectionBase = -1;
     int viewInverseBase = -1;
     int worldBase = -1;
     int viewProjectionBase = -1;
     int worldViewBase = -1;
-    int modelViewBase = -1;
-    int modelViewCount = 1;
 };
 
 static GameProfileKind g_activeGameProfile = GameProfile_None;
@@ -150,19 +149,10 @@ static bool g_profileViewDerivedFromInverse = false;
 static bool g_profileCoreRegistersSeen[3] = { false, false, false }; // proj, viewInv, world
 static bool g_profileOptionalRegistersSeen[2] = { false, false }; // VP, WV
 static char g_profileStatusMessage[256] = "";
-static D3DMATRIX g_profileViewInverseMatrix = {};
-static D3DMATRIX g_profileDerivedWorldMatrix = {};
-static D3DMATRIX g_profileLastModelViewMatrix = {};
-static bool g_profileHasViewInverseMatrix = false;
-static bool g_profileHasDerivedWorldMatrix = false;
-static bool g_profileHasLastModelViewMatrix = false;
-static bool g_profileViewInverseConsistencyOk = false;
-static float g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
 static bool g_profileDisableStructuralDetection = false;
 static bool g_mgrProjCapturedThisFrame = false;
 static bool g_mgrViewCapturedThisFrame = false;
 static bool g_mgrWorldCapturedForDraw = false;
-static uint32_t g_barnyardShaderHash = 0;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -975,7 +965,7 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
 
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
-        case GameProfile_Barnyard2006: return "Barnyard2006";
+        case GameProfile_DevilMayCry4: return "DevilMayCry4";
         case GameProfile_MetalGearRising: return "MetalGearRising";
         case GameProfile_None:
         default:
@@ -992,9 +982,10 @@ static GameProfileKind ParseGameProfile(const char* profileName) {
         _stricmp(profileName, "MetalGearRisingRevengeance") == 0) {
         return GameProfile_MetalGearRising;
     }
-    if (_stricmp(profileName, "Barnyard2006") == 0 ||
-        _stricmp(profileName, "Barnyard") == 0) {
-        return GameProfile_Barnyard2006;
+    if (_stricmp(profileName, "DevilMayCry4") == 0 ||
+        _stricmp(profileName, "DMC4") == 0 ||
+        _stricmp(profileName, "DevilMayCry4Original") == 0) {
+        return GameProfile_DevilMayCry4;
     }
     return GameProfile_None;
 }
@@ -1007,15 +998,12 @@ static void ConfigureActiveProfileLayout() {
         g_profileLayout.viewInverseBase = 12;
         g_profileLayout.worldBase = 16;
         g_profileLayout.worldViewBase = 20;
-    } else if (g_activeGameProfile == GameProfile_Barnyard2006) {
-        // Barnyard shader pipeline (worldshader.vs):
-        //   vertexViewSpace = modelViews[i] * position;
-        //   gl_Position = u_Projection * vertexViewSpace;
-        // with u_ViewWorld provided as View^-1 (camera->world).
-        g_profileLayout.projectionBase = 0;
+    } else if (g_activeGameProfile == GameProfile_DevilMayCry4) {
+        // Original DMC4 fixed layout.
+        g_profileLayout.combinedMvpBase = 0;
+        g_profileLayout.worldBase = 0;
         g_profileLayout.viewInverseBase = 4;
-        g_profileLayout.modelViewBase = 16;
-        g_profileLayout.modelViewCount = 64;
+        g_profileLayout.projectionBase = 8;
     }
 }
 
@@ -1634,33 +1622,15 @@ static void RenderImGuiOverlay() {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
             }
-            else if (g_activeGameProfile == GameProfile_Barnyard2006) {
-                ImGui::Text("Barnyard layout: Projection=c%d-c%d, ViewWorldInverse=c%d-c%d, modelViews base=c%d",
-                            g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3,
-                            g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
-                            g_profileLayout.modelViewBase);
-                ImGui::Text("Core seen: Proj=%s ViewInv=%s DerivedWorld=%s",
+            else if (g_activeGameProfile == GameProfile_DevilMayCry4) {
+                ImGui::Text("DMC4 layout: MVP=c0-c3, World=c0-c3, View=c4-c7, Projection=c8-c11");
+                ImGui::Text("Core seen: MVP/World=%s View=%s Projection=%s",
                             g_profileCoreRegistersSeen[0] ? "yes" : "no",
                             g_profileCoreRegistersSeen[1] ? "yes" : "no",
                             g_profileCoreRegistersSeen[2] ? "yes" : "no");
-                ImGui::Text("Structural detection: %s", g_profileDisableStructuralDetection ? "DISABLED (profile isolation)" : "enabled");
-                ImGui::Text("View consistency: %s (max |View*ViewInv-I| = %.6f)",
-                            g_profileViewInverseConsistencyOk ? "PASS" : "CHECK",
-                            g_profileViewInverseConsistencyError);
                 if (g_profileStatusMessage[0] != '\0') {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
-                ImGui::Separator();
-                DrawMatrixWithTranspose("Barnyard u_Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection,
-                                        g_showTransposedMatrices);
-                DrawMatrixWithTranspose("Barnyard u_ViewWorld (inverse view)", g_profileViewInverseMatrix, g_profileHasViewInverseMatrix,
-                                        g_showTransposedMatrices);
-                DrawMatrixWithTranspose("Barnyard View (derived)", g_cameraMatrices.view, g_cameraMatrices.hasView,
-                                        g_showTransposedMatrices);
-                DrawMatrixWithTranspose("Barnyard modelViews[i]", g_profileLastModelViewMatrix, g_profileHasLastModelViewMatrix,
-                                        g_showTransposedMatrices);
-                DrawMatrixWithTranspose("Barnyard World (derived per draw)", g_profileDerivedWorldMatrix, g_profileHasDerivedWorldMatrix,
-                                        g_showTransposedMatrices);
             }
             ImGui::Separator();
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
@@ -2846,6 +2816,22 @@ public:
             return;
         }
 
+        if (g_activeGameProfile == GameProfile_DevilMayCry4) {
+            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "DMC4 draw skipped: missing matrix/matrices (World=%s View=%s Proj=%s).",
+                         m_hasWorld ? "ready" : "missing",
+                         m_hasView ? "ready" : "missing",
+                         m_hasProj ? "ready" : "missing");
+                return;
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            m_real->SetTransform(D3DTS_VIEW, &m_currentView);
+            m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+            return;
+        }
+
         bool shouldApplyCustomProjection = false;
         if (g_config.experimentalCustomProjectionEnabled) {
             const bool projectionMissing = !m_hasProj;
@@ -3076,15 +3062,8 @@ public:
             return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
-        const bool profileIsBarnyardRequested = g_activeGameProfile == GameProfile_Barnyard2006;
-        uint32_t activeShaderHash = 0;
-        const bool hasActiveShaderHash = TryGetShaderBytecodeHash(shaderKey, &activeShaderHash);
-        const bool barnyardShaderMatch = !profileIsBarnyardRequested ? false :
-                                         (g_barnyardShaderHash == 0 || (hasActiveShaderHash && activeShaderHash == g_barnyardShaderHash));
-        const bool profileIsBarnyard = profileIsBarnyardRequested && barnyardShaderMatch;
-        const bool profileActive = profileIsMgr || profileIsBarnyard;
-        bool profileHardFailure = false;
-        bool profileMatchedKnownConstants = false;
+        const bool profileIsDmc4 = g_activeGameProfile == GameProfile_DevilMayCry4;
+        const bool profileActive = profileIsMgr || profileIsDmc4;
 
         auto tryExtractProfileMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
             if (!outMat || !effectiveConstantData || baseRegister < 0) {
@@ -3094,98 +3073,59 @@ public:
                                                     baseRegister, 4, false, outMat);
         };
 
-        if (profileIsBarnyard) {
+        if (profileIsDmc4) {
             D3DMATRIX mat = {};
+            bool anyCaptured = false;
+
+            if (tryExtractProfileMatrix(g_profileLayout.combinedMvpBase, &mat)) {
+                anyCaptured = true;
+                g_cameraMatrices.mvp = mat;
+                g_cameraMatrices.hasMVP = true;
+                UpdateMatrixSource(MatrixSlot_MVP, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                                   "DevilMayCry4 profile combined MVP (c0-c3)");
+                m_currentWorld = mat;
+                m_hasWorld = true;
+                slotResolvedByOverride[MatrixSlot_World] = true;
+                g_profileCoreRegistersSeen[0] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 4, false, true,
+                                 "DevilMayCry4 profile world (c0-c3)");
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
+                anyCaptured = true;
+                m_currentView = mat;
+                m_hasView = true;
+                slotResolvedByOverride[MatrixSlot_View] = true;
+                g_profileCoreRegistersSeen[1] = true;
+                g_profileViewDerivedFromInverse = false;
+                StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewInverseBase, 4, false, true,
+                                "DevilMayCry4 profile view (c4-c7)");
+            }
+
             if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
-                profileMatchedKnownConstants = true;
+                anyCaptured = true;
                 m_currentProj = mat;
                 m_hasProj = true;
                 slotResolvedByOverride[MatrixSlot_Projection] = true;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = g_profileLayout.projectionBase;
-                g_projectionDetectedHandedness = ProjectionHandedness_Left;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
                 g_projectionDetectedFovRadians = ExtractFOV(mat);
-                g_profileCoreRegistersSeen[0] = true;
+                g_profileCoreRegistersSeen[2] = true;
                 StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.projectionBase, 4, false, true,
-                                      "Barnyard profile u_Projection");
+                                      "DevilMayCry4 profile projection (c8-c11)");
             }
 
-            if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
-                profileMatchedKnownConstants = true;
-                g_profileCoreRegistersSeen[1] = true;
-                g_profileViewInverseMatrix = mat;
-                g_profileHasViewInverseMatrix = true;
-                float determinant = 0.0f;
-                D3DMATRIX derivedView = {};
-                if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
-                    m_currentView = derivedView;
-                    m_hasView = true;
-                    slotResolvedByOverride[MatrixSlot_View] = true;
-                    g_profileViewDerivedFromInverse = true;
-                    D3DMATRIX consistency = MultiplyMatrix(m_currentView, g_profileViewInverseMatrix);
-                    g_profileViewInverseConsistencyError = MatrixIdentityMaxError(consistency);
-                    g_profileViewInverseConsistencyOk = g_profileViewInverseConsistencyError < 0.02f;
-                    if (!g_profileViewInverseConsistencyOk) {
-                        LogMsg("WARNING: Barnyard View*ViewInverse consistency error=%.6f (expected identity).", g_profileViewInverseConsistencyError);
-                    }
-                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewInverseBase, 4, false, true,
-                                    "Barnyard profile View = inverse(u_ViewWorld)", g_profileLayout.viewInverseBase);
-                } else {
-                    profileHardFailure = true;
-                    g_profileViewDerivedFromInverse = false;
-                    g_profileViewInverseConsistencyOk = false;
-                    g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
-                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "WARNING: Barnyard profile failed to invert u_ViewWorld (det=%.9f).", determinant);
-                    LogMsg("WARNING: Barnyard profile failed to invert u_ViewWorld at c%d-c%d (det=%.9f).",
-                           g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3, determinant);
-                }
-            }
-
-            if (effectiveConstantData && g_profileLayout.modelViewBase >= 0) {
-                const int modelViewSpan = (std::max)(1, g_profileLayout.modelViewCount) * 4;
-                const int uploadStart = static_cast<int>(StartRegister);
-                const int uploadEnd = static_cast<int>(StartRegister + Vector4fCount - 1);
-                const int modelViewEnd = g_profileLayout.modelViewBase + modelViewSpan - 1;
-                if (uploadStart <= modelViewEnd && uploadEnd >= g_profileLayout.modelViewBase) {
-                    for (int mvBase = g_profileLayout.modelViewBase; mvBase <= modelViewEnd; mvBase += 4) {
-                        D3DMATRIX modelView = {};
-                        if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
-                                                              mvBase, 4, false, &modelView)) {
-                            continue;
-                        }
-                        profileMatchedKnownConstants = true;
-                        g_profileHasLastModelViewMatrix = true;
-                        g_profileLastModelViewMatrix = modelView;
-
-                        if (m_hasView) {
-                            D3DMATRIX viewInverse = {};
-                            float detView = 0.0f;
-                            if (InvertMatrix4x4Deterministic(m_currentView, &viewInverse, &detView)) {
-                                // Barnyard shader uses modelViews[i] = World * View. Recover World per draw:
-                                //   World = inverse(View) * ModelView.
-                                D3DMATRIX derivedWorld = MultiplyMatrix(viewInverse, modelView);
-                                m_currentWorld = derivedWorld;
-                                m_hasWorld = true;
-                                slotResolvedByOverride[MatrixSlot_World] = true;
-                                g_profileHasDerivedWorldMatrix = true;
-                                g_profileDerivedWorldMatrix = derivedWorld;
-                                g_profileCoreRegistersSeen[2] = true;
-                                StoreWorldMatrix(m_currentWorld, shaderKey, mvBase, 4, false, true,
-                                                 "Barnyard profile World = inverse(View) * modelViews[i]", mvBase);
-                            } else {
-                                profileHardFailure = true;
-                                LogMsg("WARNING: Barnyard profile could not invert derived View while reconstructing World.");
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!profileHardFailure && profileMatchedKnownConstants) {
+            if (anyCaptured) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "Barnyard profile active: Projection/ViewInverse/ModelView pipeline reconstruction enabled.");
+                         "DMC4 profile active: strict mapping MVP/World=c0-c3 View=c4-c7 Projection=c8-c11.");
+            } else {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "DMC4 profile active but upload did not hit c0-c11 transform registers.");
             }
+
+            g_profileDisableStructuralDetection = true;
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
         auto tryExplicitRegisterOverride = [&](MatrixSlot slot, int configuredRegister) {
@@ -3362,20 +3302,8 @@ public:
             }
         };
 
-        if (profileIsBarnyardRequested && !barnyardShaderMatch && g_barnyardShaderHash != 0) {
-            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                     "Barnyard profile waiting for shader hash 0x%08X (current shader not matched).",
-                     g_barnyardShaderHash);
-        }
-
-        if (profileIsBarnyard && !profileMatchedKnownConstants && !profileHardFailure) {
-            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                     "Barnyard profile active but upload did not hit configured transform registers.");
-        }
-
-        g_profileDisableStructuralDetection = profileIsBarnyard && !profileHardFailure;
-        const bool allowStructuralDetection = !profileActive || profileHardFailure ||
-                                              (!profileMatchedKnownConstants && !g_profileDisableStructuralDetection);
+        g_profileDisableStructuralDetection = false;
+        const bool allowStructuralDetection = !profileActive;
 
         bool anyStructuralMatch = false;
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
@@ -3879,31 +3807,10 @@ void LoadConfig() {
                              static_cast<DWORD>(sizeof(g_config.gameProfile)), path);
     g_activeGameProfile = ParseGameProfile(g_config.gameProfile);
     ConfigureActiveProfileLayout();
-    g_barnyardShaderHash = 0;
-    if (g_activeGameProfile == GameProfile_Barnyard2006) {
-        g_profileLayout.projectionBase = GetPrivateProfileIntA("CameraProxy", "BarnyardProjectionBase", g_profileLayout.projectionBase, path);
-        g_profileLayout.viewInverseBase = GetPrivateProfileIntA("CameraProxy", "BarnyardViewWorldBase", g_profileLayout.viewInverseBase, path);
-        g_profileLayout.modelViewBase = GetPrivateProfileIntA("CameraProxy", "BarnyardModelViewBase", g_profileLayout.modelViewBase, path);
-        g_profileLayout.modelViewCount = GetPrivateProfileIntA("CameraProxy", "BarnyardModelViewCount", g_profileLayout.modelViewCount, path);
-        if (g_profileLayout.modelViewCount < 1) g_profileLayout.modelViewCount = 1;
-        char hashText[32] = {};
-        GetPrivateProfileStringA("CameraProxy", "BarnyardShaderHash", "", hashText, sizeof(hashText), path);
-        if (hashText[0] != '\0') {
-            unsigned int parsed = 0;
-            if (sscanf(hashText, "%x", &parsed) == 1) {
-                g_barnyardShaderHash = static_cast<uint32_t>(parsed);
-            }
-        }
-    }
     g_profileCoreRegistersSeen[0] = g_profileCoreRegistersSeen[1] = g_profileCoreRegistersSeen[2] = false;
     g_profileOptionalRegistersSeen[0] = g_profileOptionalRegistersSeen[1] = false;
     g_profileViewDerivedFromInverse = false;
     g_profileStatusMessage[0] = '\0';
-    g_profileHasViewInverseMatrix = false;
-    g_profileHasDerivedWorldMatrix = false;
-    g_profileHasLastModelViewMatrix = false;
-    g_profileViewInverseConsistencyOk = false;
-    g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
     g_profileDisableStructuralDetection = false;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
@@ -4024,18 +3931,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                    g_config.experimentalCustomProjectionAutoAspectFallback,
                    ProjectionHandednessLabel(static_cast<ProjectionHandedness>(g_config.experimentalCustomProjectionAutoHandedness)));
             LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
-            if (g_activeGameProfile == GameProfile_Barnyard2006) {
-                LogMsg("Barnyard layout: proj=c%d-c%d, viewWorld=c%d-c%d, modelViews=c%d..c%d (%d matrices)",
-                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3,
+            if (g_activeGameProfile == GameProfile_DevilMayCry4) {
+                LogMsg("DMC4 layout: mvp/world=c%d-c%d, view=c%d-c%d, proj=c%d-c%d",
+                       g_profileLayout.combinedMvpBase, g_profileLayout.combinedMvpBase + 3,
                        g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
-                       g_profileLayout.modelViewBase,
-                       g_profileLayout.modelViewBase + g_profileLayout.modelViewCount * 4 - 1,
-                       g_profileLayout.modelViewCount);
-                LogMsg("Barnyard shader hash gate: %s",
-                       g_barnyardShaderHash ? "ENABLED" : "disabled");
-                if (g_barnyardShaderHash) {
-                    LogMsg("  BarnyardShaderHash=0x%08X", g_barnyardShaderHash);
-                }
+                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3);
             }
             LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
             LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");

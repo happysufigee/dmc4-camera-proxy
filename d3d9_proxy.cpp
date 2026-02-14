@@ -100,6 +100,7 @@ struct ProxyConfig {
     int experimentalCustomProjectionMode = 2; // 1 = manual matrix, 2 = auto-generated
     bool experimentalCustomProjectionOverrideDetectedProjection = false;
     bool experimentalCustomProjectionOverrideCombinedMVP = false;
+    bool mgrrUseAutoProjectionWhenC4Invalid = false;
     float experimentalCustomProjectionAutoFovDeg = 60.0f;
     float experimentalCustomProjectionAutoNearZ = 0.1f;
     float experimentalCustomProjectionAutoFarZ = 1000.0f;
@@ -153,6 +154,7 @@ static bool g_profileDisableStructuralDetection = false;
 static bool g_mgrProjCapturedThisFrame = false;
 static bool g_mgrViewCapturedThisFrame = false;
 static bool g_mgrWorldCapturedForDraw = false;
+static bool g_mgrProjectionRegisterValid = false;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -222,7 +224,7 @@ static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
-static bool g_imguiMgrrInvertView = true;
+static bool g_imguiMgrrUseAutoProjection = false;
 static bool g_imguiBaseStyleCaptured = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
@@ -1602,9 +1604,14 @@ static void RenderImGuiOverlay() {
         if (ImGui::BeginTabItem("Camera")) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
-                ImGui::Text("MGR layout: Proj=c4-c7, ViewInverse=c12-c15, World=c16-c19");
-                ImGui::Checkbox("Invert c12 View Matrix", &g_imguiMgrrInvertView);
-                ImGui::Text("Current inversion mode: %s", g_imguiMgrrInvertView ? "Inverted" : "Direct");
+                ImGui::Text("MGR layout: Proj=c4-c7, ViewProjection=c8-c11, World=c16-c19");
+                ImGui::Checkbox("Use auto projection when c4 is invalid", &g_imguiMgrrUseAutoProjection);
+                if (g_imguiMgrrUseAutoProjection != g_config.mgrrUseAutoProjectionWhenC4Invalid) {
+                    g_config.mgrrUseAutoProjectionWhenC4Invalid = g_imguiMgrrUseAutoProjection;
+                    SaveConfigBoolValue("MGRRUseAutoProjectionWhenC4Invalid",
+                                        g_config.mgrrUseAutoProjectionWhenC4Invalid);
+                }
+                ImGui::Text("Projection c4-c7 validity: %s", g_mgrProjectionRegisterValid ? "valid" : "invalid");
                 float activeViewDeterminant = 0.0f;
                 D3DMATRIX activeViewInverse = {};
                 InvertMatrix4x4Deterministic(g_cameraMatrices.view, &activeViewInverse, &activeViewDeterminant);
@@ -1613,11 +1620,11 @@ static void RenderImGuiOverlay() {
                             g_mgrProjCapturedThisFrame ? "yes" : "no",
                             g_mgrViewCapturedThisFrame ? "yes" : "no");
                 ImGui::Text("Captured for draw: World=%s", g_mgrWorldCapturedForDraw ? "yes" : "no");
-                ImGui::Text("Core seen: Proj=%s ViewInv=%s World=%s",
+                ImGui::Text("Core seen: Proj=%s ViewProj=%s World=%s",
                             g_profileCoreRegistersSeen[0] ? "yes" : "no",
                             g_profileCoreRegistersSeen[1] ? "yes" : "no",
                             g_profileCoreRegistersSeen[2] ? "yes" : "no");
-                ImGui::Text("View source: %s", g_profileViewDerivedFromInverse ? "Derived by inversion" : "Not yet derived");
+                ImGui::Text("View source: %s", g_profileViewDerivedFromInverse ? "Derived from VP via inverse projection" : "Not yet derived");
                 if (g_profileStatusMessage[0] != '\0') {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
@@ -2223,6 +2230,21 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
     return AnalyzeProjectionMatrixNumeric(m, nullptr);
 }
 
+static bool IsTypicalProjectionMatrix(const D3DMATRIX& m) {
+    ProjectionAnalysis analysis = {};
+    if (!AnalyzeProjectionMatrixNumeric(m, &analysis) || !analysis.valid) {
+        return false;
+    }
+
+    const bool perspectiveTermsLookValid =
+        fabsf(m._14) <= 0.05f &&
+        fabsf(m._24) <= 0.05f &&
+        fabsf(m._44) <= 0.05f &&
+        fabsf(fabsf(m._34) - 1.0f) <= 0.05f;
+
+    return perspectiveTermsLookValid;
+}
+
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out) {
     constexpr float kZeroEpsilon = 0.02f;
     constexpr float kPerspectiveEpsilon = 0.05f;
@@ -2772,7 +2794,7 @@ private:
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
-    bool m_mgrrInvertView = true;
+    bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
 
 public:
@@ -2780,6 +2802,7 @@ public:
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
         CreateIdentityMatrix(&m_currentWorld);
+        m_mgrrUseAutoProjection = g_config.mgrrUseAutoProjectionWhenC4Invalid;
         D3DDEVICE_CREATION_PARAMETERS params = {};
         if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
             m_hwnd = params.hFocusWindow;
@@ -2982,7 +3005,8 @@ public:
         if (profileIsMgr) {
             g_profileDisableStructuralDetection = true;
             // MGR strict known-layout mode:
-            // - capture only c4-c7 projection, c12-c15 viewInverse (invert once), c16-c19 world
+            // - capture c4-c7 projection, c8-c11 viewProjection, c16-c19 world
+            // - derive View as inverse(Projection) * ViewProjection
             // - do not run structural detection fallback or candidate scanning
             // - persist projection/view across draws until overwritten by the same known registers
             auto tryExtractMgrMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
@@ -3006,47 +3030,79 @@ public:
 
             D3DMATRIX mat = {};
             if (tryExtractMgrMatrix(4, &mat)) {
-                m_currentProj = mat;
-                m_hasProj = true;
-                g_mgrProjCapturedThisFrame = true;
                 g_profileCoreRegistersSeen[0] = true;
-                g_projectionDetectedByNumericStructure = false;
-                g_projectionDetectedRegister = 4;
-                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-                g_projectionDetectedFovRadians = ExtractFOV(mat);
-                StoreProjectionMatrix(m_currentProj, shaderKey, 4, 4, false, true,
-                                      "MetalGearRising profile projection (c4-c7)");
+                g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
+                if (g_mgrProjectionRegisterValid) {
+                    m_currentProj = mat;
+                    m_hasProj = true;
+                    g_mgrProjCapturedThisFrame = true;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = 4;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = ExtractFOV(mat);
+                    StoreProjectionMatrix(m_currentProj, shaderKey, 4, 4, false, true,
+                                          "MetalGearRising profile projection (c4-c7)");
+                } else {
+                    m_hasProj = false;
+                    g_mgrProjCapturedThisFrame = false;
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "MGR projection at c4-c7 rejected (non-typical projection values).");
+                }
             }
 
-            if (tryExtractMgrMatrix(12, &mat)) {
+            if (tryExtractMgrMatrix(8, &mat)) {
                 g_profileCoreRegistersSeen[1] = true;
-                float determinant = 0.0f;
-                if (m_mgrrInvertView) {
-                    D3DMATRIX derivedView = {};
-                    if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
+                g_profileOptionalRegistersSeen[0] = true;
+
+                D3DMATRIX resolvedProjection = {};
+                bool haveProjectionForViewDerivation = false;
+
+                if (m_hasProj) {
+                    resolvedProjection = m_currentProj;
+                    haveProjectionForViewDerivation = true;
+                } else {
+                    if (m_mgrrUseAutoProjection) {
+                        ProjectionAnalysis generatedProjectionInfo = {};
+                        if (TryExtractProjectionFromCombined(mat,
+                                                             &generatedProjectionInfo,
+                                                             &resolvedProjection,
+                                                             g_config.combinedMVPForceDecomposition)) {
+                            m_currentProj = resolvedProjection;
+                            m_hasProj = true;
+                            g_mgrProjCapturedThisFrame = true;
+                            g_projectionDetectedByNumericStructure = true;
+                            g_projectionDetectedRegister = 8;
+                            g_projectionDetectedHandedness = generatedProjectionInfo.handedness;
+                            g_projectionDetectedFovRadians = generatedProjectionInfo.fovRadians;
+                            StoreProjectionMatrix(m_currentProj, shaderKey, 8, 4, false, true,
+                                                  "MetalGearRising auto projection from VP (c8-c11)");
+                            haveProjectionForViewDerivation = true;
+                        }
+                    }
+                }
+
+                if (haveProjectionForViewDerivation) {
+                    D3DMATRIX projectionInv = {};
+                    if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
+                        D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
+                        OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
                         m_hasView = true;
                         g_mgrViewCapturedThisFrame = true;
                         g_profileViewDerivedFromInverse = true;
                         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                                 "MGR view updated from c12-c15 inverse (det=%.6f).", determinant);
-                        StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
-                                        "MetalGearRising profile view derived from inverse", 12);
+                                 "MGR view updated from VP (c8-c11) using inverse projection.");
+                        StoreViewMatrix(m_currentView, shaderKey, 8, 4, false, true,
+                                        "MetalGearRising profile view from VP", 8);
                     } else {
                         g_profileViewDerivedFromInverse = false;
                         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                                 "WARNING: MGR c12-c15 inversion failed (det=%.9f); preserving previous View.",
-                                 determinant);
+                                 "MGR VP derivation failed: projection inversion failed.");
                     }
                 } else {
-                    m_currentView = mat;
-                    m_hasView = true;
-                    g_mgrViewCapturedThisFrame = true;
                     g_profileViewDerivedFromInverse = false;
                     snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "MGR view updated from c12-c15 directly.");
-                    StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
-                                    "MetalGearRising profile view direct from c12-c15", 12);
+                             "MGR VP detected but no valid projection (c4 invalid). Enable auto projection to derive view.");
                 }
             }
 
@@ -3393,9 +3449,9 @@ public:
         if (g_imguiInitialized) {
             ImGui::GetIO().MouseDrawCursor = g_showImGui;
         }
-        g_imguiMgrrInvertView = m_mgrrInvertView;
+        g_imguiMgrrUseAutoProjection = m_mgrrUseAutoProjection;
         RenderImGuiOverlay();
-        m_mgrrInvertView = g_imguiMgrrInvertView;
+        m_mgrrUseAutoProjection = g_imguiMgrrUseAutoProjection;
         if (g_requestManualEmit) {
             EmitFixedFunctionTransforms();
             g_requestManualEmit = false;
@@ -3463,6 +3519,7 @@ public:
             g_mgrWorldCapturedForDraw = false;
             g_mgrProjCapturedThisFrame = false;
             g_mgrViewCapturedThisFrame = false;
+            g_mgrProjectionRegisterValid = false;
         }
         return m_real->BeginScene();
     }
@@ -3843,6 +3900,8 @@ void LoadConfig() {
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
     g_config.experimentalCustomProjectionOverrideCombinedMVP =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideCombinedMVP", 0, path) != 0;
+    g_config.mgrrUseAutoProjectionWhenC4Invalid =
+        GetPrivateProfileIntA("CameraProxy", "MGRRUseAutoProjectionWhenC4Invalid", 0, path) != 0;
 
     char customBuf[64] = {};
     GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoFovDeg", "60.0", customBuf, sizeof(customBuf), path);
@@ -3924,6 +3983,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                    g_config.experimentalCustomProjectionOverrideDetectedProjection ? "yes" : "no");
             LogMsg("Experimental custom projection overrides combined MVP: %s",
                    g_config.experimentalCustomProjectionOverrideCombinedMVP ? "yes" : "no");
+            LogMsg("MGR: use auto projection when c4 projection is invalid: %s",
+                   g_config.mgrrUseAutoProjectionWhenC4Invalid ? "yes" : "no");
             LogMsg("Experimental custom projection auto params: fov=%.2f near=%.5f far=%.2f aspectFallback=%.5f handedness=%s",
                    g_config.experimentalCustomProjectionAutoFovDeg,
                    g_config.experimentalCustomProjectionAutoNearZ,

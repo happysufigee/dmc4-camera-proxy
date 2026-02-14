@@ -2139,15 +2139,6 @@ static void RenderImGuiOverlay() {
                                     TryAssignManualMatrixFromSelection(MatrixSlot_MVP, sourceShaderKey,
                                                                        base, selectedRows, mat);
                                 }
-                                if (ImGui::Button("Use as VP")) {
-                                    TryAssignManualMatrixFromSelection(MatrixSlot_VP, sourceShaderKey,
-                                                                       base, selectedRows, mat);
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Button("Use as WV")) {
-                                    TryAssignManualMatrixFromSelection(MatrixSlot_WV, sourceShaderKey,
-                                                                       base, selectedRows, mat);
-                                }
                                 ImGui::PopID();
                             }
                             ImGui::TreePop();

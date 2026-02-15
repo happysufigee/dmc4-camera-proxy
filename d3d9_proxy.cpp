@@ -101,6 +101,7 @@ struct ProxyConfig {
     bool experimentalCustomProjectionOverrideDetectedProjection = false;
     bool experimentalCustomProjectionOverrideCombinedMVP = false;
     bool mgrrUseAutoProjectionWhenC4Invalid = false;
+    bool barnyardUseGameSetTransformsForViewProjection = true;
     float experimentalCustomProjectionAutoFovDeg = 60.0f;
     float experimentalCustomProjectionAutoNearZ = 0.1f;
     float experimentalCustomProjectionAutoFarZ = 1000.0f;
@@ -132,7 +133,8 @@ struct CombinedMVPDebugState {
 enum GameProfileKind {
     GameProfile_None = 0,
     GameProfile_MetalGearRising,
-    GameProfile_DevilMayCry4
+    GameProfile_DevilMayCry4,
+    GameProfile_Barnyard
 };
 
 struct RegisterLayoutProfile {
@@ -155,6 +157,7 @@ static bool g_mgrProjCapturedThisFrame = false;
 static bool g_mgrViewCapturedThisFrame = false;
 static bool g_mgrWorldCapturedForDraw = false;
 static bool g_mgrProjectionRegisterValid = false;
+static bool g_barnyardForceWorldFromC0 = false;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -232,6 +235,7 @@ static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
 static bool g_imguiMgrrUseAutoProjection = false;
+static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
 static bool g_imguiBaseStyleCaptured = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
@@ -1056,6 +1060,7 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
 
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
+        case GameProfile_Barnyard: return "Barnyard";
         case GameProfile_DevilMayCry4: return "DevilMayCry4";
         case GameProfile_MetalGearRising: return "MetalGearRising";
         case GameProfile_None:
@@ -1077,6 +1082,10 @@ static GameProfileKind ParseGameProfile(const char* profileName) {
         _stricmp(profileName, "DMC4") == 0 ||
         _stricmp(profileName, "DevilMayCry4Original") == 0) {
         return GameProfile_DevilMayCry4;
+    }
+    if (_stricmp(profileName, "Barnyard") == 0 ||
+        _stricmp(profileName, "Barnyard2006") == 0) {
+        return GameProfile_Barnyard;
     }
     return GameProfile_None;
 }
@@ -1771,6 +1780,24 @@ static void RenderImGuiOverlay() {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
             }
+            else if (g_activeGameProfile == GameProfile_Barnyard) {
+                ImGui::Text("Barnyard profile: WORLD from VS constants; VIEW/PROJECTION via intercepted game SetTransform");
+                if (ImGui::Checkbox("Use intercepted game View/Projection SetTransform", &g_imguiBarnyardUseGameSetTransformsForViewProjection)) {
+                    g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
+                    SaveConfigBoolValue("BarnyardUseGameSetTransformsForViewProjection",
+                                        g_config.barnyardUseGameSetTransformsForViewProjection);
+                }
+                if (ImGui::Checkbox("Always use c0-c3 as World", &g_barnyardForceWorldFromC0)) {
+                    SaveConfigBoolValue("BarnyardForceWorldFromC0", g_barnyardForceWorldFromC0);
+                }
+                ImGui::Text("Seen: View=%s Projection=%s World=%s",
+                            g_profileCoreRegistersSeen[0] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[1] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[2] ? "yes" : "no");
+                if (g_profileStatusMessage[0] != '\0') {
+                    ImGui::TextWrapped("%s", g_profileStatusMessage);
+                }
+            }
             ImGui::Separator();
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
                                     g_showTransposedMatrices);
@@ -2262,15 +2289,6 @@ static void RenderImGuiOverlay() {
                                     ImGui::SameLine();
                                     if (ImGui::Button("Use as MVP")) {
                                         TryAssignManualMatrixFromSelection(MatrixSlot_MVP, g_selectedShaderKey,
-                                                                           base, selectedRows, assignedMat);
-                                    }
-                                    if (ImGui::Button("Use as VP")) {
-                                        TryAssignManualMatrixFromSelection(MatrixSlot_VP, g_selectedShaderKey,
-                                                                           base, selectedRows, assignedMat);
-                                    }
-                                    ImGui::SameLine();
-                                    if (ImGui::Button("Use as WV")) {
-                                        TryAssignManualMatrixFromSelection(MatrixSlot_WV, g_selectedShaderKey,
                                                                            base, selectedRows, assignedMat);
                                     }
                                     ImGui::PopID();
@@ -3116,6 +3134,25 @@ public:
             return;
         }
 
+        if (g_activeGameProfile == GameProfile_Barnyard) {
+            const bool useGameViewProj = g_config.barnyardUseGameSetTransformsForViewProjection;
+            if (!m_hasWorld || (useGameViewProj && (!m_hasView || !m_hasProj))) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard draw skipped: missing matrices (World=%s View=%s Proj=%s).",
+                         m_hasWorld ? "ready" : "missing",
+                         m_hasView ? "ready" : "missing",
+                         m_hasProj ? "ready" : "missing");
+                return;
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            if (useGameViewProj) {
+                m_real->SetTransform(D3DTS_VIEW, &m_currentView);
+                m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+            }
+            return;
+        }
+
         bool shouldApplyCustomProjection = false;
         if (g_config.experimentalCustomProjectionEnabled) {
             const bool projectionMissing = !m_hasProj;
@@ -3198,11 +3235,12 @@ public:
         RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
+        const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
 
         std::vector<float> overrideScratch;
         const float* effectiveConstantData = pConstantData;
         // Keep MGR profile extraction isolated from manual/override paths.
-        if (!profileIsMgr && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+        if (!profileIsMgr && !profileIsBarnyard && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
 
@@ -3238,7 +3276,7 @@ public:
         bool slotResolvedByOverride[MatrixSlot_Count] = {};
         bool slotResolvedStructurally[MatrixSlot_Count] = {};
 
-        if (!profileIsMgr && shaderKey != 0) {
+        if (!profileIsMgr && !profileIsBarnyard && shaderKey != 0) {
             for (int slot = 0; slot < MatrixSlot_Count; slot++) {
                 const ManualMatrixBinding& binding = g_manualBindings[slot];
                 if (!binding.enabled || binding.shaderKey != shaderKey) {
@@ -3397,8 +3435,86 @@ public:
             return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
+        if (profileIsBarnyard) {
+            bool worldCaptured = false;
+            D3DMATRIX mat = {};
+
+            if (g_barnyardForceWorldFromC0 &&
+                TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                 0, 4, false, &mat)) {
+                m_currentWorld = mat;
+                m_hasWorld = true;
+                worldCaptured = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, 0, 4, false, true,
+                                 "Barnyard profile forced world (c0-c3)");
+            }
+
+            if (!worldCaptured && g_config.worldMatrixRegister >= 0 &&
+                TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                 g_config.worldMatrixRegister, 4, false, &mat)) {
+                m_currentWorld = mat;
+                m_hasWorld = true;
+                worldCaptured = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, g_config.worldMatrixRegister, 4, false, true,
+                                 "Barnyard profile world (explicit register override)");
+            }
+
+            if (!worldCaptured && g_config.autoDetectMatrices && effectiveConstantData && Vector4fCount >= 3) {
+                for (UINT rows : {4u, 3u}) {
+                    if (Vector4fCount < rows || worldCaptured) {
+                        continue;
+                    }
+                    for (UINT offset = 0; offset + rows <= Vector4fCount; ++offset) {
+                        UINT baseReg = StartRegister + offset;
+                        D3DMATRIX candidate = {};
+                        if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData + offset * 4, baseReg, rows,
+                                                              static_cast<int>(baseReg), static_cast<int>(rows),
+                                                              false, &candidate)) {
+                            continue;
+                        }
+
+                        MatrixClassification cls = ClassifyMatrixDeterministic(candidate, static_cast<int>(rows),
+                                                                               Vector4fCount, StartRegister, baseReg);
+                        bool transposed = false;
+                        if (cls == MatrixClass_None && g_probeTransposedLayouts) {
+                            D3DMATRIX t = TransposeMatrix(candidate);
+                            cls = ClassifyMatrixDeterministic(t, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                            if (cls != MatrixClass_None) {
+                                candidate = t;
+                                transposed = true;
+                            }
+                        }
+
+                        if (cls == MatrixClass_World) {
+                            m_currentWorld = candidate;
+                            m_hasWorld = true;
+                            worldCaptured = true;
+                            g_profileCoreRegistersSeen[2] = true;
+                            StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg),
+                                             static_cast<int>(rows), transposed, false,
+                                             "Barnyard profile structural world");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (worldCaptured) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active: forwarding WORLD only; VIEW/PROJECTION SetTransform blocked.");
+            } else {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active: waiting for world matrix in shader constants.");
+            }
+
+            g_profileDisableStructuralDetection = true;
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+        }
+
         const bool profileIsDmc4 = g_activeGameProfile == GameProfile_DevilMayCry4;
-        const bool profileActive = profileIsMgr || profileIsDmc4;
+        const bool profileActive = profileIsMgr || profileIsDmc4 || profileIsBarnyard;
 
         auto tryExtractProfileMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
             if (!outMat || !effectiveConstantData || baseRegister < 0) {
@@ -3729,13 +3845,22 @@ public:
             ImGui::GetIO().MouseDrawCursor = g_showImGui;
         }
         g_imguiMgrrUseAutoProjection = m_mgrrUseAutoProjection;
+        g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
         RenderImGuiOverlay();
         m_mgrrUseAutoProjection = g_imguiMgrrUseAutoProjection;
+        g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
         if (g_requestManualEmit) {
             EmitFixedFunctionTransforms();
             g_requestManualEmit = false;
-            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
-                     "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
+            if (g_activeGameProfile == GameProfile_Barnyard) {
+                snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                         g_config.barnyardUseGameSetTransformsForViewProjection
+                             ? "Sent cached World/View/Projection matrices to RTX Remix via SetTransform()."
+                             : "Sent cached World matrix to RTX Remix via SetTransform().");
+            } else {
+                snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                         "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
+            }
         }
 
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
@@ -3804,7 +3929,50 @@ public:
     }
     HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
-    HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override { return m_real->SetTransform(State, pMatrix); }
+    HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
+        if (g_activeGameProfile == GameProfile_Barnyard &&
+            (State == D3DTS_VIEW || State == D3DTS_PROJECTION)) {
+            if (!g_config.barnyardUseGameSetTransformsForViewProjection || !pMatrix) {
+                return D3D_OK;
+            }
+
+            const HRESULT setHr = m_real->SetTransform(State, pMatrix);
+            D3DMATRIX captured = *pMatrix;
+            D3DMATRIX roundTrip = {};
+            const HRESULT getHr = m_real->GetTransform(State, &roundTrip);
+            if (SUCCEEDED(getHr)) {
+                captured = roundTrip;
+            }
+
+            if (State == D3DTS_VIEW) {
+                m_currentView = captured;
+                m_hasView = true;
+                g_profileCoreRegistersSeen[0] = true;
+                StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                SUCCEEDED(getHr)
+                                    ? "Barnyard intercepted game SetTransform(View)+GetTransform"
+                                    : "Barnyard intercepted game SetTransform(View)");
+            } else {
+                m_currentProj = captured;
+                m_hasProj = true;
+                g_profileCoreRegistersSeen[1] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = -1;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(captured);
+                StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                      SUCCEEDED(getHr)
+                                          ? "Barnyard intercepted game SetTransform(Projection)+GetTransform"
+                                          : "Barnyard intercepted game SetTransform(Projection)");
+            }
+
+            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                     "Barnyard intercepted game %s transform and cached for draw-time forwarding.",
+                     State == D3DTS_VIEW ? "VIEW" : "PROJECTION");
+            return setHr;
+        }
+        return m_real->SetTransform(State, pMatrix);
+    }
     HRESULT STDMETHODCALLTYPE GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) override { return m_real->GetTransform(State, pMatrix); }
     HRESULT STDMETHODCALLTYPE MultiplyTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override { return m_real->MultiplyTransform(State, pMatrix); }
     HRESULT STDMETHODCALLTYPE SetViewport(const D3DVIEWPORT9* pViewport) override { return m_real->SetViewport(pViewport); }
@@ -4155,6 +4323,10 @@ void LoadConfig() {
     g_profileViewDerivedFromInverse = false;
     g_profileStatusMessage[0] = '\0';
     g_profileDisableStructuralDetection = false;
+    g_barnyardForceWorldFromC0 = GetPrivateProfileIntA("CameraProxy", "BarnyardForceWorldFromC0", 0, path) != 0;
+    g_config.barnyardUseGameSetTransformsForViewProjection =
+        GetPrivateProfileIntA("CameraProxy", "BarnyardUseGameSetTransformsForViewProjection", 1, path) != 0;
+    g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                  "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
@@ -4271,6 +4443,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                    g_config.experimentalCustomProjectionOverrideCombinedMVP ? "yes" : "no");
             LogMsg("MGR: use auto projection when c4 projection is invalid: %s",
                    g_config.mgrrUseAutoProjectionWhenC4Invalid ? "yes" : "no");
+            LogMsg("Barnyard: force world from c0-c3: %s",
+                   g_barnyardForceWorldFromC0 ? "yes" : "no");
+            LogMsg("Barnyard: use intercepted game view/proj transforms: %s",
+                   g_config.barnyardUseGameSetTransformsForViewProjection ? "yes" : "no");
             LogMsg("Experimental custom projection auto params: fov=%.2f near=%.5f far=%.2f aspectFallback=%.5f handedness=%s",
                    g_config.experimentalCustomProjectionAutoFovDeg,
                    g_config.experimentalCustomProjectionAutoNearZ,

@@ -52,7 +52,7 @@ If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once 
 You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 - `GameProfile=MetalGearRising`
-- `GameProfile=Barnyard2006`
+- `GameProfile=Barnyard` (or `Barnyard2006`)
 
 **Metal Gear Rising profile**
 
@@ -63,25 +63,14 @@ You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 If expected uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
 
-**Barnyard 2006 profile (dedicated transform reconstruction)**
+**Barnyard profile**
 
-Barnyard shaders use a combined path similar to:
-
-- `vertexViewSpace = modelViews[i] * position`
-- `gl_Position = u_Projection * vertexViewSpace`
-
-and also provide `u_ViewWorld` (camera→world, i.e. inverse View).
-
-Profile behavior:
-
-- Extract `u_Projection` from `BarnyardProjectionBase`.
-- Extract `u_ViewWorld` from `BarnyardViewWorldBase`, derive `View = inverse(u_ViewWorld)`.
-- Verify `View * u_ViewWorld ≈ I` and report consistency in overlay/log.
-- For each per-instance `modelViews[i]` upload (`BarnyardModelViewBase`, `BarnyardModelViewCount`), derive:
-  - `World = inverse(View) * modelViews[i]`
-- Emit fixed-function transforms per draw (`WORLD`, `VIEW`, `PROJECTION`) from these derived matrices.
-- While Barnyard profile is active, structural auto-detection is disabled to avoid misclassifying combined `modelViews` data.
-- Optional shader signature gating via `BarnyardShaderHash` ensures the profile only activates on expected shader bytecode.
+- The proxy intercepts game `SetTransform(VIEW/PROJECTION)` calls and can round-trip them via `GetTransform()` to capture final 4x4 matrices.
+- Captured VIEW/PROJECTION are cached and re-forwarded at draw time from the proxy path (instead of relying on the game call timing).
+- WORLD is detected from vertex shader constant uploads using deterministic structural classification.
+- Optional toggles:
+  - `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
+  - `BarnyardUseGameSetTransformsForViewProjection=1` enables interception/capture of game VIEW/PROJECTION transforms.
 
 ### 6) Draw-time emission
 

@@ -53,6 +53,7 @@ You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 - `GameProfile=MetalGearRising`
 - `GameProfile=Barnyard` (or `Barnyard2006`)
+- `GameProfile=Wolfenstein2009` (or `Wolf2009`)
 
 **Metal Gear Rising profile**
 
@@ -71,6 +72,29 @@ If expected uploads are not matched or inverse-view inversion fails (non-inverti
 - Optional toggles:
   - `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
   - `BarnyardUseGameSetTransformsForViewProjection=1` enables interception/capture of game VIEW/PROJECTION transforms.
+
+
+**Wolfenstein (2009) profile**
+
+Structural-only extraction path with deterministic register layouts:
+
+- Static mesh shader layout
+  - `c0-c3`  → `ModelViewProjection` (float4x4)
+  - `c4-c6`  → `ModelView` (float4x3 expanded to 4x4)
+  - `c7-c9`  → `Model` (float4x3 expanded to 4x4)
+  - Algebraic decomposition:
+    - `World = Model`
+    - `View = inverse(Model) * ModelView`
+    - `Projection = inverse(ModelView) * ModelViewProjection`
+    - `VP = View * Projection`
+- VP-only shader layout
+  - `c0-c3` → `ViewProjection`
+  - Proxy isolates Projection from VP and derives `View = inverse(Projection) * VP`.
+- Skinning shader layout
+  - `c0-c74`  contains SkinToView transforms (ignored for View extraction)
+  - `c75-c78` contains Projection (captured as projection-only fallback)
+
+ImGui runtime toggles are available for VP-only preference and skinning-projection fallback.
 
 ### 6) Draw-time emission
 

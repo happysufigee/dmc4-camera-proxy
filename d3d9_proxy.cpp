@@ -134,7 +134,8 @@ enum GameProfileKind {
     GameProfile_None = 0,
     GameProfile_MetalGearRising,
     GameProfile_DevilMayCry4,
-    GameProfile_Barnyard
+    GameProfile_Barnyard,
+    GameProfile_Wolfenstein2009
 };
 
 struct RegisterLayoutProfile {
@@ -158,6 +159,8 @@ static bool g_mgrViewCapturedThisFrame = false;
 static bool g_mgrWorldCapturedForDraw = false;
 static bool g_mgrProjectionRegisterValid = false;
 static bool g_barnyardForceWorldFromC0 = false;
+static bool g_wolfPreferViewProjectionOnly = false;
+static bool g_wolfAllowSkinningProjection = true;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -1063,6 +1066,7 @@ static const char* GameProfileLabel(GameProfileKind profile) {
         case GameProfile_Barnyard: return "Barnyard";
         case GameProfile_DevilMayCry4: return "DevilMayCry4";
         case GameProfile_MetalGearRising: return "MetalGearRising";
+        case GameProfile_Wolfenstein2009: return "Wolfenstein2009";
         case GameProfile_None:
         default:
             return "None";
@@ -1087,6 +1091,11 @@ static GameProfileKind ParseGameProfile(const char* profileName) {
         _stricmp(profileName, "Barnyard2006") == 0) {
         return GameProfile_Barnyard;
     }
+    if (_stricmp(profileName, "Wolfenstein2009") == 0 ||
+        _stricmp(profileName, "Wolf2009") == 0 ||
+        _stricmp(profileName, "Wolfenstein") == 0) {
+        return GameProfile_Wolfenstein2009;
+    }
     return GameProfile_None;
 }
 
@@ -1104,6 +1113,13 @@ static void ConfigureActiveProfileLayout() {
         g_profileLayout.worldBase = 0;
         g_profileLayout.viewInverseBase = 4;
         g_profileLayout.projectionBase = 8;
+    } else if (g_activeGameProfile == GameProfile_Wolfenstein2009) {
+        // Wolfenstein (2009) structural layout.
+        g_profileLayout.combinedMvpBase = 0;   // c0-c3  : ModelViewProjection or ViewProjection
+        g_profileLayout.worldViewBase = 4;     // c4-c6  : ModelView (float4x3)
+        g_profileLayout.worldBase = 7;         // c7-c9  : Model (float4x3)
+        g_profileLayout.projectionBase = 75;   // c75-c78: Skinning projection-only upload
+        g_profileLayout.viewProjectionBase = 0;
     }
 }
 
@@ -1794,6 +1810,20 @@ static void RenderImGuiOverlay() {
                             g_profileCoreRegistersSeen[0] ? "yes" : "no",
                             g_profileCoreRegistersSeen[1] ? "yes" : "no",
                             g_profileCoreRegistersSeen[2] ? "yes" : "no");
+                if (g_profileStatusMessage[0] != '\0') {
+                    ImGui::TextWrapped("%s", g_profileStatusMessage);
+                }
+            }
+            else if (g_activeGameProfile == GameProfile_Wolfenstein2009) {
+                ImGui::Text("Wolfenstein (2009) layout: MVP=c0-c3, MV=c4-c6, M=c7-c9, VP-only=c0-c3, skin proj=c75-c78");
+                ImGui::Checkbox("Prefer VP-only decomposition over static M/MV/MVP", &g_wolfPreferViewProjectionOnly);
+                ImGui::Checkbox("Allow projection fallback from skinning c75-c78", &g_wolfAllowSkinningProjection);
+                ImGui::Text("Seen: MVP=%s MV=%s M=%s VP=%s SkinProj=%s",
+                            g_profileCoreRegistersSeen[0] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[1] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[2] ? "yes" : "no",
+                            g_profileOptionalRegistersSeen[0] ? "yes" : "no",
+                            g_profileOptionalRegistersSeen[1] ? "yes" : "no");
                 if (g_profileStatusMessage[0] != '\0') {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
@@ -2959,6 +2989,17 @@ static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
     return true;
 }
 
+static bool TryIsolateProjectionFromViewProjection(const D3DMATRIX& vp,
+                                                   D3DMATRIX* outProjection,
+                                                   ProjectionAnalysis* outAnalysis) {
+    // Structural/algebraic decomposition only: treat VP as View*Projection and
+    // reconstruct a projection matrix that can be inverted for view recovery.
+    return TryExtractProjectionFromCombined(vp,
+                                            outAnalysis,
+                                            outProjection,
+                                            true);
+}
+
 static bool TryDecomposeCombinedMVP(const D3DMATRIX& mvp,
                                     const D3DMATRIX* worldOptional,
                                     bool worldAvailable,
@@ -3236,11 +3277,12 @@ public:
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
         const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
+        const bool profileIsWolf = g_activeGameProfile == GameProfile_Wolfenstein2009;
 
         std::vector<float> overrideScratch;
         const float* effectiveConstantData = pConstantData;
         // Keep MGR profile extraction isolated from manual/override paths.
-        if (!profileIsMgr && !profileIsBarnyard && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+        if (!profileIsMgr && !profileIsBarnyard && !profileIsWolf && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
 
@@ -3276,7 +3318,7 @@ public:
         bool slotResolvedByOverride[MatrixSlot_Count] = {};
         bool slotResolvedStructurally[MatrixSlot_Count] = {};
 
-        if (!profileIsMgr && !profileIsBarnyard && shaderKey != 0) {
+        if (!profileIsMgr && !profileIsBarnyard && !profileIsWolf && shaderKey != 0) {
             for (int slot = 0; slot < MatrixSlot_Count; slot++) {
                 const ManualMatrixBinding& binding = g_manualBindings[slot];
                 if (!binding.enabled || binding.shaderKey != shaderKey) {
@@ -3514,7 +3556,7 @@ public:
         }
 
         const bool profileIsDmc4 = g_activeGameProfile == GameProfile_DevilMayCry4;
-        const bool profileActive = profileIsMgr || profileIsDmc4 || profileIsBarnyard;
+        const bool profileActive = profileIsMgr || profileIsDmc4 || profileIsBarnyard || profileIsWolf;
 
         auto tryExtractProfileMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
             if (!outMat || !effectiveConstantData || baseRegister < 0) {
@@ -3573,6 +3615,163 @@ public:
             } else {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                          "DMC4 profile active but upload did not hit c0-c11 transform registers.");
+            }
+
+            g_profileDisableStructuralDetection = true;
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+        }
+
+        if (profileIsWolf) {
+            auto tryExtractWolfMatrix = [&](int baseRegister, int rows, D3DMATRIX* outMat) -> bool {
+                if (!outMat || !effectiveConstantData || baseRegister < 0) {
+                    return false;
+                }
+                return TryBuildMatrixFromConstantUpdate(effectiveConstantData,
+                                                        StartRegister,
+                                                        Vector4fCount,
+                                                        baseRegister,
+                                                        rows,
+                                                        false,
+                                                        outMat);
+            };
+
+            D3DMATRIX model = {};
+            D3DMATRIX modelView = {};
+            D3DMATRIX modelViewProjection = {};
+            D3DMATRIX viewProjection = {};
+            D3DMATRIX skinProjection = {};
+
+            const bool hasM = tryExtractWolfMatrix(g_profileLayout.worldBase, 3, &model);
+            const bool hasMV = tryExtractWolfMatrix(g_profileLayout.worldViewBase, 3, &modelView);
+            const bool hasMVP = tryExtractWolfMatrix(g_profileLayout.combinedMvpBase, 4, &modelViewProjection);
+            const bool hasVPOnly = tryExtractWolfMatrix(g_profileLayout.viewProjectionBase, 4, &viewProjection);
+            const bool hasSkinProjection = g_wolfAllowSkinningProjection &&
+                                           tryExtractWolfMatrix(g_profileLayout.projectionBase, 4, &skinProjection);
+
+            bool captured = false;
+
+            if (hasMVP && hasMV && hasM && !g_wolfPreferViewProjectionOnly) {
+                D3DMATRIX invModel = {};
+                D3DMATRIX invModelView = {};
+                if (InvertMatrix4x4Deterministic(model, &invModel, nullptr) &&
+                    InvertMatrix4x4Deterministic(modelView, &invModelView, nullptr)) {
+                    D3DMATRIX view = MultiplyMatrix(invModel, modelView);
+                    D3DMATRIX projection = MultiplyMatrix(invModelView, modelViewProjection);
+                    D3DMATRIX vp = MultiplyMatrix(view, projection);
+
+                    m_currentWorld = model;
+                    m_currentView = view;
+                    m_currentProj = projection;
+                    m_hasWorld = true;
+                    m_hasView = true;
+                    m_hasProj = true;
+
+                    g_profileCoreRegistersSeen[0] = true;
+                    g_profileCoreRegistersSeen[1] = true;
+                    g_profileCoreRegistersSeen[2] = true;
+
+                    StoreMVPMatrix(modelViewProjection, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                                   "Wolfenstein profile MVP (c0-c3)");
+                    StoreWVMatrix(modelView, shaderKey, g_profileLayout.worldViewBase, 3, false, true,
+                                  "Wolfenstein profile MV expanded (c4-c6)");
+                    StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 3, false, true,
+                                     "Wolfenstein profile World from Model (c7-c9)");
+                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.worldViewBase, 3, false, true,
+                                    "Wolfenstein profile View = inverse(Model) * ModelView");
+                    StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                                          "Wolfenstein profile Projection = inverse(ModelView) * ModelViewProjection");
+                    StoreVPMatrix(vp, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                                  "Wolfenstein profile VP = View * Projection");
+
+                    g_profileViewDerivedFromInverse = false;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = g_profileLayout.combinedMvpBase;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = ExtractFOV(m_currentProj);
+                    captured = true;
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "Wolfenstein static layout: M(c7-c9), MV(c4-c6), MVP(c0-c3) decomposed algebraically.");
+                }
+            }
+
+            if (!captured && hasVPOnly) {
+                D3DMATRIX isolatedProjection = {};
+                ProjectionAnalysis vpAnalysis = {};
+                if (TryIsolateProjectionFromViewProjection(viewProjection, &isolatedProjection, &vpAnalysis)) {
+                    D3DMATRIX invProjection = {};
+                    if (InvertMatrix4x4Deterministic(isolatedProjection, &invProjection, nullptr)) {
+                        D3DMATRIX view = MultiplyMatrix(invProjection, viewProjection);
+                        m_currentView = view;
+                        m_currentProj = isolatedProjection;
+                        m_hasView = true;
+                        m_hasProj = true;
+
+                        g_profileOptionalRegistersSeen[0] = true;
+                        g_profileViewDerivedFromInverse = true;
+                        StoreVPMatrix(viewProjection, shaderKey, g_profileLayout.viewProjectionBase, 4, false, true,
+                                      "Wolfenstein profile VP-only (c0-c3)");
+                        StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.viewProjectionBase, 4, false, true,
+                                              "Wolfenstein profile Projection isolated from VP");
+                        StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewProjectionBase, 4, false, true,
+                                        "Wolfenstein profile View = inverse(Projection) * VP");
+                        g_projectionDetectedByNumericStructure = false;
+                        g_projectionDetectedRegister = g_profileLayout.viewProjectionBase;
+                        g_projectionDetectedHandedness = vpAnalysis.handedness;
+                        g_projectionDetectedFovRadians = vpAnalysis.fovRadians;
+                        captured = true;
+                        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                                 "Wolfenstein VP-only layout: decomposed c0-c3 into View and Projection.");
+                    }
+                }
+            }
+
+            if (!captured && hasMVP && hasMV && hasM && g_wolfPreferViewProjectionOnly) {
+                D3DMATRIX invModel = {};
+                D3DMATRIX invModelView = {};
+                if (InvertMatrix4x4Deterministic(model, &invModel, nullptr) &&
+                    InvertMatrix4x4Deterministic(modelView, &invModelView, nullptr)) {
+                    D3DMATRIX view = MultiplyMatrix(invModel, modelView);
+                    D3DMATRIX projection = MultiplyMatrix(invModelView, modelViewProjection);
+                    m_currentWorld = model;
+                    m_currentView = view;
+                    m_currentProj = projection;
+                    m_hasWorld = true;
+                    m_hasView = true;
+                    m_hasProj = true;
+                    g_profileViewDerivedFromInverse = false;
+                    g_profileCoreRegistersSeen[0] = true;
+                    g_profileCoreRegistersSeen[1] = true;
+                    g_profileCoreRegistersSeen[2] = true;
+                    StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 3, false, true,
+                                     "Wolfenstein profile World from Model (c7-c9)");
+                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.worldViewBase, 3, false, true,
+                                    "Wolfenstein profile View = inverse(Model) * ModelView");
+                    StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                                          "Wolfenstein profile Projection = inverse(ModelView) * ModelViewProjection");
+                    captured = true;
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "Wolfenstein static layout fallback used (VP-only preference did not resolve camera).");
+                }
+            }
+
+            if (!captured && hasSkinProjection) {
+                m_currentProj = skinProjection;
+                m_hasProj = true;
+                g_profileOptionalRegistersSeen[1] = true;
+                StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.projectionBase, 4, false, true,
+                                      "Wolfenstein skinning projection-only (c75-c78)");
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = g_profileLayout.projectionBase;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(m_currentProj);
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Wolfenstein skinning layout: cached projection from c75-c78; keeping previous View.");
+                captured = true;
+            }
+
+            if (!captured) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Wolfenstein profile active: waiting for static M/MV/MVP, VP-only, or skinning projection upload.");
             }
 
             g_profileDisableStructuralDetection = true;
@@ -4458,6 +4657,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                 LogMsg("DMC4 layout: mvp/world=c%d-c%d, view=c%d-c%d, proj=c%d-c%d",
                        g_profileLayout.combinedMvpBase, g_profileLayout.combinedMvpBase + 3,
                        g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
+                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3);
+            } else if (g_activeGameProfile == GameProfile_Wolfenstein2009) {
+                LogMsg("Wolfenstein layout: MVP=c%d-c%d MV=c%d-c%d Model=c%d-c%d SkinProj=c%d-c%d",
+                       g_profileLayout.combinedMvpBase, g_profileLayout.combinedMvpBase + 3,
+                       g_profileLayout.worldViewBase, g_profileLayout.worldViewBase + 2,
+                       g_profileLayout.worldBase, g_profileLayout.worldBase + 2,
                        g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3);
             }
             LogMsg("ImGui scale: %.2fx", g_config.imguiScale);

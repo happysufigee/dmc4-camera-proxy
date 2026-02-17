@@ -231,6 +231,8 @@ static void UpdateMatrixSource(MatrixSlot slot,
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
+static bool g_imguiWasVisible = false;
+static bool g_prevShowImGui = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
@@ -400,6 +402,39 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return CallWindowProc(g_imguiPrevWndProc, hwnd, msg, wParam, lParam);
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void EnsureWndProcHookInstalled() {
+    if (!g_imguiInitialized || !g_imguiHwnd) {
+        return;
+    }
+    WNDPROC current = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+    if (current != ImGuiWndProcHook) {
+        g_imguiPrevWndProc = current;
+        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                         reinterpret_cast<LONG_PTR>(ImGuiWndProcHook));
+    }
+}
+
+static void NormalizeShowCursorCount(bool wantVisible) {
+    if (wantVisible) {
+        int count = ShowCursor(TRUE);
+        while (count < 0) {
+            count = ShowCursor(TRUE);
+        }
+        while (count > 0) {
+            count = ShowCursor(FALSE);
+        }
+    } else {
+        int count = ShowCursor(FALSE);
+        while (count >= 0) {
+            count = ShowCursor(FALSE);
+        }
+        while (count < -1) {
+            count = ShowCursor(TRUE);
+        }
+    }
 }
 
 static void StoreViewMatrix(const D3DMATRIX& view,
@@ -635,15 +670,28 @@ static void ShutdownImGui() {
         return;
     }
 
+    if (g_imguiWasVisible) {
+        NormalizeShowCursorCount(false);
+        g_imguiWasVisible = false;
+    }
+
+    // Remove our hook first so ImGui_ImplWin32_Shutdown restores correctly.
+    if (g_imguiHwnd && g_imguiPrevWndProc) {
+        WNDPROC current = reinterpret_cast<WNDPROC>(
+            GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+        if (current == ImGuiWndProcHook) {
+            SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
+        }
+    }
+
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_imguiInitialized = false;
-    if (g_imguiPrevWndProc && g_imguiHwnd) {
-        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
-    }
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
+    g_prevShowImGui = false;
 }
 
 static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
@@ -1643,6 +1691,8 @@ static void UpdateConstantSnapshot() {
 }
 
 static void UpdateHotkeys() {
+    EnsureWndProcHookInstalled();
+
     if (ConsumeSingleKeyHotkey(HotkeyAction_ToggleMenu, g_config.hotkeyToggleMenuVk)) {
         g_showImGui = !g_showImGui;
     }
@@ -1665,6 +1715,12 @@ static void UpdateHotkeys() {
     if (ConsumeSingleKeyHotkey(HotkeyAction_ResetMatrixOverrides, g_config.hotkeyResetMatrixOverridesVk)) {
         ResetMatrixRegisterOverridesToAuto();
     }
+
+    if (g_showImGui && !g_prevShowImGui) {
+        // Menu just became visible — release any game mouse capture.
+        ReleaseCapture();
+    }
+    g_prevShowImGui = g_showImGui;
 }
 
 static void UpdateFrameTimeStats() {
@@ -1700,9 +1756,21 @@ static void UpdateFrameTimeStats() {
 }
 
 static void RenderImGuiOverlay() {
+    EnsureWndProcHookInstalled();
+
     if (!g_imguiInitialized || !g_showImGui) {
         g_constantUploadRecordingEnabled = false;
+        if (g_imguiWasVisible) {
+            NormalizeShowCursorCount(false);
+            g_imguiWasVisible = false;
+        }
         return;
+    }
+
+    ClipCursor(NULL);
+    if (!g_imguiWasVisible) {
+        NormalizeShowCursorCount(true);
+        g_imguiWasVisible = true;
     }
 
     CameraMatrices camSnapshot = {};
@@ -1714,6 +1782,17 @@ static void RenderImGuiOverlay() {
     ApplyImGuiScale(g_imguiHwnd);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    if (g_showImGui) {
+        POINT cursorScreen = {};
+        if (GetCursorPos(&cursorScreen) && ScreenToClient(g_imguiHwnd, &cursorScreen)) {
+            ImGui::GetIO().MousePos = ImVec2(
+                static_cast<float>(cursorScreen.x),
+                static_cast<float>(cursorScreen.y));
+        }
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    }
     ImGui::GetIO().MouseDrawCursor = true;
     ImGui::NewFrame();
 
@@ -2719,6 +2798,36 @@ static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m,
     return MatrixClass_None;
 }
 
+static int CountStridedCandidates(const float* data,
+                                  UINT startReg,
+                                  UINT vectorCount,
+                                  UINT strideRows,
+                                  MatrixClassification targetClass) {
+    int count = 0;
+    for (UINT offset = 0; offset + strideRows <= vectorCount; offset += strideRows) {
+        D3DMATRIX candidate = {};
+        if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                              startReg + offset,
+                                              strideRows,
+                                              static_cast<int>(startReg + offset),
+                                              static_cast<int>(strideRows),
+                                              false,
+                                              &candidate)) {
+            continue;
+        }
+        MatrixClassification cls = ClassifyMatrixDeterministic(
+            candidate,
+            static_cast<int>(strideRows),
+            vectorCount,
+            startReg,
+            startReg + offset);
+        if (cls == targetClass && ++count > 1) {
+            return count;
+        }
+    }
+    return count;
+}
+
 static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX out = {};
     out._11 = a._11*b._11 + a._12*b._21 + a._13*b._31 + a._14*b._41;
@@ -2741,6 +2850,35 @@ static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     out._43 = a._41*b._13 + a._42*b._23 + a._43*b._33 + a._44*b._43;
     out._44 = a._41*b._14 + a._42*b._24 + a._43*b._34 + a._44*b._44;
     return out;
+}
+
+
+// Returns true if candidateView is consistent with being a pure orthonormal
+// view matrix relative to knownProjection.
+static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
+                                               const D3DMATRIX& knownProjection) {
+    D3DMATRIX vp = MultiplyMatrix(candidateView, knownProjection);
+
+    const float p_c0 = sqrtf(
+        knownProjection._11 * knownProjection._11 +
+        knownProjection._21 * knownProjection._21 +
+        knownProjection._31 * knownProjection._31);
+    const float p_c1 = sqrtf(
+        knownProjection._12 * knownProjection._12 +
+        knownProjection._22 * knownProjection._22 +
+        knownProjection._32 * knownProjection._32);
+    const float vp_c0 = sqrtf(
+        vp._11 * vp._11 + vp._21 * vp._21 + vp._31 * vp._31);
+    const float vp_c1 = sqrtf(
+        vp._12 * vp._12 + vp._22 * vp._22 + vp._32 * vp._32);
+
+    if (p_c0 < 1e-6f || p_c1 < 1e-6f) {
+        return true;
+    }
+
+    constexpr float kTol = 0.05f;
+    return (fabsf(vp_c0 - p_c0) / p_c0 < kTol) &&
+           (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
 }
 
 static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
@@ -3177,6 +3315,10 @@ private:
     int m_viewLastFrame = -1;
     int m_projLastFrame = -1;
     int m_worldLastFrame = -1;
+    uintptr_t m_viewLockedShader = 0;
+    int m_viewLockedRegister = -1;
+    uintptr_t m_projLockedShader = 0;
+    int m_projLockedRegister = -1;
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
@@ -3874,38 +4016,75 @@ public:
             }
         };
 
+        bool suppressViewFromUpload = false;
+        bool suppressWorldFromUpload = false;
+
         auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows, bool transposed) {
             MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
 
-            if (cls == MatrixClass_Projection && g_config.projMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_Projection] && !slotResolvedStructurally[MatrixSlot_Projection]) {
+            if (cls == MatrixClass_Projection &&
+                g_config.projMatrixRegister < 0 &&
+                !slotResolvedByOverride[MatrixSlot_Projection] &&
+                !slotResolvedStructurally[MatrixSlot_Projection]) {
                 ProjectionAnalysis projectionInfo = {};
-                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) {
-                    return;
+                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) return;
+                if (projectionInfo.fovRadians < g_config.minFOV ||
+                    projectionInfo.fovRadians > g_config.maxFOV) return;
+
+                const bool sameSource =
+                    (m_projLockedShader == 0) ||
+                    (shaderKey == m_projLockedShader &&
+                     static_cast<int>(baseReg) == m_projLockedRegister);
+                if (sameSource) {
+                    m_projLockedShader = shaderKey;
+                    m_projLockedRegister = static_cast<int>(baseReg);
+                    m_currentProj = mat;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_Projection] = true;
+                    g_projectionDetectedByNumericStructure = true;
+                    g_projectionDetectedFovRadians = projectionInfo.fovRadians;
+                    g_projectionDetectedRegister = static_cast<int>(baseReg);
+                    g_projectionDetectedHandedness = projectionInfo.handedness;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg),
+                                          rows, transposed, false,
+                                          "deterministic structural projection");
+                    LogMsg("Projection accepted: c%d-c%d rows=%d fov=%.2f deg (%s)",
+                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1, rows,
+                           projectionInfo.fovRadians * 180.0f / 3.14159265f,
+                           ProjectionHandednessLabel(projectionInfo.handedness));
                 }
-                if (projectionInfo.fovRadians < g_config.minFOV || projectionInfo.fovRadians > g_config.maxFOV) {
-                    return;
+            } else if (cls == MatrixClass_View &&
+                       !suppressViewFromUpload &&
+                       g_config.viewMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_View] &&
+                       !slotResolvedStructurally[MatrixSlot_View]) {
+                const bool sameSource =
+                    (m_viewLockedShader == 0) ||
+                    (shaderKey == m_viewLockedShader &&
+                     static_cast<int>(baseReg) == m_viewLockedRegister);
+                if (sameSource) {
+                    if (m_hasProj && !CrossValidateViewAgainstProjection(mat, m_currentProj)) {
+                        // Column norms of candidateView * P do not match column norms of P.
+                        // This is WV, VP, or some other combined form — not a pure view matrix.
+                        // Do not mark slotResolvedStructurally so detection can continue.
+                        return;
+                    }
+                    m_viewLockedShader = shaderKey;
+                    m_viewLockedRegister = static_cast<int>(baseReg);
+                    m_currentView = mat;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_View] = true;
+                    StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg),
+                                    rows, transposed, false,
+                                    "deterministic structural view");
                 }
-                m_currentProj = mat;
-                m_hasProj = true;
-                m_projLastFrame = g_frameCount;
-                slotResolvedStructurally[MatrixSlot_Projection] = true;
-                g_projectionDetectedByNumericStructure = true;
-                g_projectionDetectedFovRadians = projectionInfo.fovRadians;
-                g_projectionDetectedRegister = static_cast<int>(baseReg);
-                g_projectionDetectedHandedness = projectionInfo.handedness;
-                StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural projection");
-                LogMsg("Projection accepted via numeric structure: c%d-c%d rows=%d transpose=%d fov=%.2f deg (%s)",
-                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
-                       rows, transposed ? 1 : 0,
-                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
-                       ProjectionHandednessLabel(projectionInfo.handedness));
-            } else if (cls == MatrixClass_View && g_config.viewMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_View]) {
-                m_currentView = mat;
-                m_hasView = true;
-                m_viewLastFrame = g_frameCount;
-                slotResolvedStructurally[MatrixSlot_View] = true;
-                StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural view");
-            } else if (cls == MatrixClass_World && g_config.worldMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedStructurally[MatrixSlot_World]) {
+            } else if (cls == MatrixClass_World &&
+                       !suppressWorldFromUpload &&
+                       g_config.worldMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_World] &&
+                       !slotResolvedStructurally[MatrixSlot_World]) {
                 m_currentWorld = mat;
                 m_hasWorld = true;
                 m_worldLastFrame = g_frameCount;
@@ -3922,6 +4101,27 @@ public:
 
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
+
+        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 4) {
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_View) > 1) {
+                suppressViewFromUpload = true;
+            }
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_World) > 1) {
+                suppressWorldFromUpload = true;
+            }
+            if (!suppressViewFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_View) > 1) {
+                suppressViewFromUpload = true;
+            }
+            if (!suppressWorldFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_World) > 1) {
+                suppressWorldFromUpload = true;
+            }
+        }
 
         bool anyStructuralMatch = false;
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
@@ -4069,6 +4269,7 @@ public:
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
         if (g_imguiInitialized) {
             ImGui_ImplDX9_InvalidateDeviceObjects();
+            // Do NOT call ImGui_ImplWin32_Shutdown here.
         }
         HRESULT hr = m_real->Reset(pPresentationParameters);
         if (SUCCEEDED(hr) && g_imguiInitialized) {
@@ -4110,6 +4311,11 @@ public:
             g_mgrProjCapturedThisFrame = false;
             g_mgrViewCapturedThisFrame = false;
             g_mgrProjectionRegisterValid = false;
+        } else if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
         }
         return m_real->BeginScene();
     }

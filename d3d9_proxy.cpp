@@ -3181,7 +3181,7 @@ private:
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
         if (m_real) {
-            m_real->QueryInterface(IID_IDirect3DDevice9Ex, reinterpret_cast<void**>(&m_realEx));
+            m_real->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&m_realEx));
         }
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
@@ -3338,12 +3338,12 @@ public:
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
         if (!ppvObj) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IDirect3DDevice9) {
+        if (riid == IID_IUnknown || riid == __uuidof(IDirect3DDevice9)) {
             *ppvObj = static_cast<IDirect3DDevice9*>(this);
             AddRef();
             return S_OK;
         }
-        if (riid == IID_IDirect3DDevice9Ex && m_realEx) {
+        if (riid == __uuidof(IDirect3DDevice9Ex) && m_realEx) {
             *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
             AddRef();
             return S_OK;

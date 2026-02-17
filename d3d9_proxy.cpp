@@ -2777,6 +2777,12 @@ static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m,
     return MatrixClass_None;
 }
 
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout);
+
 static int CountStridedCandidates(const float* data,
                                   UINT startReg,
                                   UINT vectorCount,
@@ -2800,11 +2806,71 @@ static int CountStridedCandidates(const float* data,
             vectorCount,
             startReg,
             startReg + offset);
+
+        if (strideRows == 3u &&
+            (cls == MatrixClass_View || cls == MatrixClass_World) &&
+            IsThreeRowPrefixOfPerspectiveMatrix(data,
+                                                startReg,
+                                                vectorCount,
+                                                startReg + offset,
+                                                false)) {
+            continue;
+        }
+
         if (cls == targetClass && ++count > 1) {
             return count;
         }
     }
     return count;
+}
+
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout) {
+    if (!data || vectorCount < 4) {
+        return false;
+    }
+    if (candidateBaseReg < startReg) {
+        return false;
+    }
+
+    const UINT offset = candidateBaseReg - startReg;
+    if (offset + 4 > vectorCount) {
+        return false;
+    }
+
+    D3DMATRIX candidate4x4 = {};
+    if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                          candidateBaseReg,
+                                          4u,
+                                          static_cast<int>(candidateBaseReg),
+                                          4,
+                                          transposedLayout,
+                                          &candidate4x4)) {
+        return false;
+    }
+
+    const MatrixClassification directClass = ClassifyMatrixDeterministic(
+        candidate4x4,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    if (directClass == MatrixClass_Projection || directClass == MatrixClass_CombinedPerspective) {
+        return true;
+    }
+
+    const D3DMATRIX transposed = TransposeMatrix(candidate4x4);
+    const MatrixClassification transposedClass = ClassifyMatrixDeterministic(
+        transposed,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    return transposedClass == MatrixClass_Projection ||
+           transposedClass == MatrixClass_CombinedPerspective;
 }
 
 static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
@@ -4134,6 +4200,15 @@ public:
                     }
 
                     MatrixClassification finalClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                    if (rows == 3u &&
+                        (finalClass == MatrixClass_View || finalClass == MatrixClass_World) &&
+                        IsThreeRowPrefixOfPerspectiveMatrix(effectiveConstantData,
+                                                            StartRegister,
+                                                            Vector4fCount,
+                                                            baseReg,
+                                                            transposed)) {
+                        finalClass = MatrixClass_None;
+                    }
                     if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
                         const float row0Len = sqrtf(Dot3(mat._11, mat._12, mat._13, mat._11, mat._12, mat._13));
                         const float row1Len = sqrtf(Dot3(mat._21, mat._22, mat._23, mat._21, mat._22, mat._23));

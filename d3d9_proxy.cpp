@@ -3700,22 +3700,12 @@ public:
                 return;
             }
 
-            D3DMATRIX worldToEmit = m_currentWorld;
             g_lastInverseViewAsWorldEligible = false;
             g_lastInverseViewAsWorldApplied = false;
             g_lastInverseViewAsWorldUsedFast = false;
-            if (g_config.experimentalInverseViewAsWorld) {
-                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
-                g_lastInverseViewAsWorldEligible = viewLooksValid;
-                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
-                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
-                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
-                        g_lastInverseViewAsWorldApplied = true;
-                    }
-                }
-            }
 
-            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
+            // Keep DMC4 strict and deterministic: WORLD always comes from c0-c3.
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
@@ -3732,22 +3722,12 @@ public:
                 return;
             }
 
-            D3DMATRIX worldToEmit = m_currentWorld;
             g_lastInverseViewAsWorldEligible = false;
             g_lastInverseViewAsWorldApplied = false;
             g_lastInverseViewAsWorldUsedFast = false;
-            if (g_config.experimentalInverseViewAsWorld && m_hasView) {
-                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
-                g_lastInverseViewAsWorldEligible = viewLooksValid;
-                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
-                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
-                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
-                        g_lastInverseViewAsWorldApplied = true;
-                    }
-                }
-            }
 
-            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
+            // Keep Barnyard profile semantics deterministic: WORLD comes from shader constants.
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             if (useGameViewProj) {
                 m_real->SetTransform(D3DTS_VIEW, &m_currentView);
                 m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);

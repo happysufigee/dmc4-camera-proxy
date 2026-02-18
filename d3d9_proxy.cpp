@@ -341,6 +341,7 @@ static bool g_constantUploadRecordingEnabled = false;
 static bool g_probeInverseView = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
+static std::mutex g_shaderStateMutex;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
 
 static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
@@ -397,7 +398,6 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
 static std::unordered_map<uintptr_t, bool> g_disabledShaders = {};
-static std::mutex g_shaderStateMutex;
 static unsigned long long g_constantChangeSerial = 0;
 static unsigned long long g_constantUploadSerial = 0;
 static std::deque<ConstantUploadEvent> g_constantUploadEvents = {};
@@ -3957,7 +3957,6 @@ private:
         for (UINT s=0;s<16;++s) {
             if (IsInstancedFrequency(m_streamFreq[s])) { g_tbnDiagnostics.skipsInstancing++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         }
-        auto t0 = std::chrono::high_resolution_clock::now();
         IDirect3DVertexBuffer9* vb = m_streamBindings[layout.positionStream].vb;
         const UINT stride = m_streamBindings[layout.positionStream].stride;
         if (stride < layout.positionOffset + 12) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }

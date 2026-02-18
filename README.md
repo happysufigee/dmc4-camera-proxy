@@ -1,92 +1,131 @@
 # camera-proxy (experimental branch)
 
-Experimental Direct3D9 proxy DLL for RTX Remix.
+Experimental Direct3D9 proxy DLL for RTX Remix focused on deterministic matrix extraction and draw-time state emission for programmable DX9 games.
 
-This branch is focused on **deterministic matrix extraction** for arbitrary DX9 engines instead of DMC4-only assumptions. The proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches current transform state, and forwards fixed-function transforms immediately before draw calls.
+## Branch status at a glance
 
-## Why this exists
+This **experimental** branch now includes:
 
-Many programmable DX9 games never call fixed-function `SetTransform()` while RTX Remix depends on those transform states for scene reconstruction. A naive approach that forwards transforms during `SetVertexShaderConstantF()` is often out-of-sync with the actual draw that consumes those constants.
+- deterministic matrix classification from vertex shader constants,
+- draw-time fixed-function transform emission for Remix compatibility,
+- game-specific extraction profiles (Metal Gear Rising, Barnyard),
+- transposed/inverse probing safeguards,
+- expanded input compatibility with frame-polled hotkeys,
+- ImGui overlay scaling controls,
+- experimental mesh attribute forwarding (normal/tangent/binormal generation), and
+- diagnostics-rich overlay tabs for camera state, constants, normals, memory scanning, and logs.
 
-This proxy solves that by:
+The main goal remains: keep camera/transform extraction stable across engines that do not reliably use fixed-function `SetTransform()` timing.
 
-- tracking matrix state from constant uploads,
-- and emitting `SetTransform(D3DTS_WORLD/VIEW/PROJECTION)` **per draw call** (`DrawPrimitive`, `DrawIndexedPrimitive`, `DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`).
+---
 
-## Current behavior (experimental)
+## Why this branch exists
+
+Many DX9 titles are heavily shader-driven and never issue fixed-function transform calls in the way RTX Remix expects. Forwarding transforms at constant-upload time (`SetVertexShaderConstantF`) is often temporally wrong for the draw that eventually consumes those constants.
+
+This proxy resolves that mismatch by:
+
+1. observing and caching candidate transform matrices from constant uploads,
+2. classifying them with deterministic structural checks,
+3. emitting `D3DTS_WORLD`, `D3DTS_VIEW`, and `D3DTS_PROJECTION` immediately before intercepted draw calls.
+
+---
+
+## Core extraction pipeline
 
 ### 1) Matrix state caching
 
-The proxy maintains three cached matrices:
+The proxy caches:
 
-- current World
-- current View
-- current Projection
+- World
+- View
+- Projection
 
-State is updated when constant uploads match structural rules, but forwarding is deferred until draw time.
+State updates happen on constant upload analysis; forwarding is deferred until draw interception.
 
 ### 2) Deterministic structural classification
 
-Constant upload windows are interpreted as potential `4x4` and `4x3` matrices.
+Observed constant windows are interpreted as `4x4` / `4x3` candidates.
 
-- **Projection**: strict perspective structure + FOV validation (`MinFOV`, `MaxFOV`).
+Classification logic:
+
+- **Projection**: strict perspective structure + `MinFOV` / `MaxFOV` validation.
 - **View**: strict orthonormal affine camera-style matrix.
 - **World**: affine matrix that is not strict View.
-- **Combined perspective fallback**: if perspective-like but not strict Projection, World/View are set to identity and the matrix is forwarded as Projection.
+- **Perspective fallback**: if perspective-like but not strict Projection, World and View are set to identity and the matrix is forwarded as Projection.
 
-No probabilistic ranking or MVP decomposition is performed in this path.
+No probabilistic ranking or MVP decomposition is used in this path.
 
-### 3) Transpose probing
+### 3) Layout probing
 
-If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once and re-checked deterministically.
+When `ProbeTransposedLayouts=1`, failed candidates are transposed once and re-validated deterministically.
 
-### 4) Register overrides
+### 4) Register override controls
 
-`ViewMatrixRegister`, `ProjMatrixRegister`, and `WorldMatrixRegister`:
+`ViewMatrixRegister`, `ProjMatrixRegister`, `WorldMatrixRegister`:
 
-- `>= 0` means only that base register is accepted for that type.
-- `-1` means classify from all observed constant ranges.
+- `>= 0` → only that base register is accepted for the corresponding type.
+- `-1` → classify from all observed constant ranges.
 
-### 5) Game profiles
+### 5) Draw-time emission
 
-You can enable fixed-profile extraction via `camera_proxy.ini`:
+When `EmitFixedFunctionTransforms=1`, cached WORLD/VIEW/PROJECTION are emitted before each intercepted draw call:
 
-- `GameProfile=MetalGearRising`
-- `GameProfile=Barnyard` (or `Barnyard2006`)
+- `DrawPrimitive`
+- `DrawIndexedPrimitive`
+- `DrawPrimitiveUP`
+- `DrawIndexedPrimitiveUP`
 
-**Metal Gear Rising profile**
+Unknown matrix types fall back to identity to preserve valid fixed-function state.
 
-- `c4-c7`   → Projection
-- `c12-c15` → View Inverse (inverted deterministically to derive View)
+---
+
+## Game profile support
+
+Enable with `GameProfile` in `camera_proxy.ini`.
+
+### Metal Gear Rising (`GameProfile=MetalGearRising`)
+
+Mapped registers:
+
+- `c4-c7` → Projection
+- `c12-c15` → View Inverse (deterministically inverted to derive View)
 - `c16-c19` → World
-- optional tracking only: `c8-c11` (ViewProjection), `c20-c23` (WorldView)
 
-If expected uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
+Optional tracking-only ranges:
 
-**Barnyard profile**
+- `c8-c11` (ViewProjection)
+- `c20-c23` (WorldView)
 
-- The proxy intercepts game `SetTransform(VIEW/PROJECTION)` calls and can round-trip them via `GetTransform()` to capture final 4x4 matrices.
-- Captured VIEW/PROJECTION are cached and re-forwarded at draw time from the proxy path (instead of relying on the game call timing).
-- WORLD is detected from vertex shader constant uploads using deterministic structural classification.
-- Optional toggles:
-  - `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
-  - `BarnyardUseGameSetTransformsForViewProjection=1` enables interception/capture of game VIEW/PROJECTION transforms.
+If expected uploads are missing or inverse-view inversion fails (non-invertible), the proxy logs status/warnings and falls back to structural auto-detection.
 
-### 6) Draw-time emission
+### Barnyard (`GameProfile=Barnyard` or `Barnyard2006`)
 
-When `EmitFixedFunctionTransforms=1`, cached WORLD/VIEW/PROJECTION are emitted before each intercepted draw call.
+Behavior:
 
-If a matrix type is unknown, identity is used as fallback to keep fixed-function state valid.
+- Intercepts game `SetTransform(VIEW/PROJECTION)` calls.
+- Optionally round-trips through `GetTransform()` to capture final matrices.
+- Caches VIEW/PROJECTION and re-emits at draw time from proxy-controlled timing.
+- Detects WORLD from vertex shader constants using deterministic structural classification.
 
-### 7) ImGui overlay scaling
+Profile toggles:
 
-This branch includes configurable UI scaling:
+- `BarnyardForceWorldFromC0=1` forces `c0-c3` uploads as WORLD.
+- `BarnyardUseGameSetTransformsForViewProjection=1` enables VIEW/PROJECTION capture from game transform calls.
 
-- `ImGuiScalePercent` in `camera_proxy.ini`, and
-- runtime slider in the overlay.
+---
 
-Scaling is applied to both style metrics and fonts.
+## Experimental normals/TBN forwarding
 
+When `EnableTBNForwarding=1`, the proxy inspects vertex input state from:
+
+- `SetVertexDeclaration`
+- `SetFVF`
+- `SetStreamSource`
+- `SetStreamSourceFreq`
+- `SetIndices`
+
+For supported indexed triangle-list draws with missing attributes, the proxy can:
 
 
 ### 9) Experimental mesh attribute forwarding (normals/TBN)
@@ -111,44 +150,75 @@ Diagnostics and controls are available in the new **Normals** overlay tab.
 
 ### 8) Input compatibility and hotkeys
 
-To support titles where ImGui input is unreliable, single-key hotkeys are polled every frame and can drive core actions even with the overlay hidden:
+Safety behavior:
 
-- `HotkeyToggleMenuVK` (default F10)
-- `HotkeyTogglePauseVK` (default F9)
-- `HotkeyEmitMatricesVK` (default F8)
-- `HotkeyResetMatrixOverridesVK` (default F7)
+- Unsupported primitive types, instancing, missing requirements, decode failures, and size-limit violations are safely skipped.
+- On any failure path, the original draw is still forwarded unchanged.
+- Current implementation is focused on indexed triangle lists; non-indexed and UP paths are diagnostics-only.
 
-Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to deterministic structural auto-detection.
+Detailed counters, skip reasons, and timings are exposed in the **Normals** overlay tab.
+
+---
+
+## Overlay and runtime controls
+
+### Overlay tabs
+
+- **Camera**: live World/View/Projection/MVP state and source metadata.
+- **Constants**: captured constant registers + editing tools.
+- **Normals**: TBN forwarding toggles, counters, skip reasons, timing stats.
+- **Memory Scanner**: optional background scan and matrix assignment actions.
+- **Logs**: in-overlay logging stream.
+
+### Input compatibility hotkeys (frame-polled)
+
+To support titles where ImGui input routing is unreliable, hotkeys are polled every frame:
+
+- `HotkeyToggleMenuVK` (default `F10`)
+- `HotkeyTogglePauseVK` (default `F9`)
+- `HotkeyEmitMatricesVK` (default `F8`)
+- `HotkeyResetMatrixOverridesVK` (default `F7`)
+
+Resetting matrix overrides sets `View/Proj/WorldMatrixRegister=-1`; if `AutoDetectMatrices=1`, deterministic structural auto-detection resumes immediately.
+
+### UI scaling
+
+- `ImGuiScalePercent` in `camera_proxy.ini`
+- runtime scale slider in overlay
+
+Scaling applies to style metrics and fonts.
 
 ---
 
 ## Setup
 
 1. Install RTX Remix runtime files in your game directory.
-2. Rename Remix's runtime DLL to `d3d9_remix.dll` (or update `RemixDllName`).
+2. Rename Remix runtime DLL to `d3d9_remix.dll` (or set `RemixDllName`).
 3. Copy this project’s built `d3d9.dll` into the game directory.
 4. Copy `camera_proxy.ini` into the same directory.
-5. Launch the game. Toggle the overlay with **F10** (configurable in `camera_proxy.ini`).
+5. Launch the game and toggle overlay with `F10` (configurable).
 
 ## Build
 
-### Option A (VS Developer Command Prompt)
+### Option A: Visual Studio Developer Command Prompt
 
 ```bat
 build.bat
 ```
 
-### Option B (generic shell; script locates VS toolchain)
+### Option B: Generic shell (script locates VS toolchain)
 
 ```bat
 do_build.bat
 ```
 
-Output is a 32-bit `d3d9.dll`.
+Build output: 32-bit `d3d9.dll`.
 
-## Key config options
+---
 
-See `camera_proxy.ini` for full comments. Most important keys:
+## Key configuration options
+
+See `camera_proxy.ini` for full comments. Frequently used:
 
 - `UseRemixRuntime`
 - `RemixDllName`
@@ -159,6 +229,7 @@ See `camera_proxy.ini` for full comments. Most important keys:
 - `AutoDetectMatrices`
 - `ProbeTransposedLayouts`
 - `ProbeInverseView`
+- `EnableTBNForwarding`
 - `ImGuiScalePercent`
 - `EnableLogging`
 - `GameProfile`
@@ -173,7 +244,8 @@ See `camera_proxy.ini` for full comments. Most important keys:
 
 ## Notes
 
-- This is an **experimental branch** intended for iterative engine compatibility testing.
+- This branch is intentionally iterative and compatibility-driven.
+- Deterministic behavior is favored over heuristic guessing wherever possible.
 
 ## Credits
 

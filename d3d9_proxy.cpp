@@ -47,6 +47,7 @@ static void LogMsg(const char* fmt, ...);
 static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
+static float Dot3(float ax, float ay, float az, float bx, float by, float bz);
 
 enum ProjectionHandedness {
     ProjectionHandedness_Unknown = 0,

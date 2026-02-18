@@ -88,6 +88,27 @@ This branch includes configurable UI scaling:
 Scaling is applied to both style metrics and fonts.
 
 
+
+### 9) Experimental mesh attribute forwarding (normals/TBN)
+
+The proxy now tracks vertex input state (`SetVertexDeclaration`, `SetFVF`, `SetStreamSource`, `SetStreamSourceFreq`, `SetIndices`) and inspects draw-time input layouts for `NORMAL`, `TANGENT`, and `BINORMAL` semantics.
+
+When enabled (`EnableTBNForwarding=1`), indexed triangle-list draws with missing attributes can be patched by:
+
+- decoding positions (+ UV0 when available),
+- generating deterministic normals and optional tangents/binormals,
+- appending generated attributes through an extra vertex stream,
+- binding a patched declaration for the draw,
+- then restoring original declaration/stream state.
+
+Safety behavior:
+
+- unsupported primitive types, instancing, missing required attributes, decode failures, and draw-size limit violations are skipped safely,
+- original draw is always forwarded unchanged on any failure path,
+- current support focuses on indexed triangle lists; non-indexed/UP paths are currently scan-only diagnostics.
+
+Diagnostics and controls are available in the new **Normals** overlay tab.
+
 ### 8) Input compatibility and hotkeys
 
 To support titles where ImGui input is unreliable, single-key hotkeys are polled every frame and can drive core actions even with the overlay hidden:
@@ -146,6 +167,7 @@ See `camera_proxy.ini` for full comments. Most important keys:
 
 - **Camera**: live World/View/Projection/MVP display and source metadata.
 - **Constants**: captured registers and shader-constant editing tools.
+- **Normals**: TBN forwarding toggles, counters, skip reasons, and timing stats.
 - **Memory Scanner**: optional background memory scan controls and matrix assignment actions.
 - **Logs**: in-overlay log stream.
 

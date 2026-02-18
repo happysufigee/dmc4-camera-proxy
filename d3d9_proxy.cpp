@@ -26,6 +26,9 @@
 #include <limits>
 #include <mutex>
 #include <cassert>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -120,7 +123,33 @@ struct ProxyConfig {
     bool experimentalInverseViewAsWorld = false;
     bool experimentalInverseViewAsWorldAllowUnverified = false;
     bool experimentalInverseViewAsWorldFast = false;
+
+    bool enableTBNForwarding = false;
+    bool generateNormalsIfMissing = true;
+    bool generateTangentsIfMissing = false;
+    bool generateBinormalsIfMissing = false;
+    int tbnMaxVerticesPerDraw = 65535;
+    int tbnMaxTrianglesPerDraw = 65535;
+    bool tbnLogVerbose = false;
 };
+
+struct TbnDiagnostics {
+    uint64_t drawsScanned = 0;
+    uint64_t drawsPatched = 0;
+    uint64_t drawsMissingNormals = 0;
+    uint64_t drawsMissingFullTBN = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    uint64_t skipsUnsupportedPrimitive = 0;
+    uint64_t skipsInstancing = 0;
+    uint64_t skipsMissingPosition = 0;
+    uint64_t skipsMissingUv = 0;
+    uint64_t skipsDecodeFailure = 0;
+    uint64_t skipsDrawTooLarge = 0;
+    uint64_t generationTimeUs = 0;
+};
+
+static TbnDiagnostics g_tbnDiagnostics = {};
 
 enum CombinedMVPStrategy {
     CombinedMVPStrategy_None = 0,
@@ -1067,6 +1096,10 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
 
 static bool SaveConfigBoolValue(const char* key, bool value) {
     return SaveConfigRegisterValue(key, value ? 1 : 0);
+}
+
+static bool SaveConfigIntValue(const char* key, int value) {
+    return SaveConfigRegisterValue(key, value);
 }
 
 static bool SaveConfigFloatValue(const char* key, float value) {
@@ -2684,6 +2717,46 @@ static void RenderImGuiOverlay() {
             ImGui::EndTabItem();
         }
 
+
+        if (ImGui::BeginTabItem("Normals")) {
+            ImGui::TextWrapped("TBN forwarding inspects draw input layouts and can generate missing NORMAL/TANGENT/BINORMAL attributes for indexed triangle lists.");
+            if (ImGui::Checkbox("Enable TBN forwarding", &g_config.enableTBNForwarding)) {
+                SaveConfigBoolValue("EnableTBNForwarding", g_config.enableTBNForwarding);
+            }
+            if (ImGui::Checkbox("Generate normals when missing", &g_config.generateNormalsIfMissing)) {
+                SaveConfigBoolValue("GenerateNormalsIfMissing", g_config.generateNormalsIfMissing);
+            }
+            if (ImGui::Checkbox("Generate tangents when missing", &g_config.generateTangentsIfMissing)) {
+                SaveConfigBoolValue("GenerateTangentsIfMissing", g_config.generateTangentsIfMissing);
+            }
+            if (ImGui::Checkbox("Generate binormals when missing", &g_config.generateBinormalsIfMissing)) {
+                SaveConfigBoolValue("GenerateBinormalsIfMissing", g_config.generateBinormalsIfMissing);
+            }
+            ImGui::InputInt("Max vertices per draw", &g_config.tbnMaxVerticesPerDraw);
+            ImGui::InputInt("Max triangles per draw", &g_config.tbnMaxTrianglesPerDraw);
+            if (g_config.tbnMaxVerticesPerDraw < 128) g_config.tbnMaxVerticesPerDraw = 128;
+            if (g_config.tbnMaxTrianglesPerDraw < 128) g_config.tbnMaxTrianglesPerDraw = 128;
+            SaveConfigIntValue("TBNMaxVerticesPerDraw", g_config.tbnMaxVerticesPerDraw);
+            SaveConfigIntValue("TBNMaxTrianglesPerDraw", g_config.tbnMaxTrianglesPerDraw);
+            if (ImGui::Checkbox("Verbose TBN logs", &g_config.tbnLogVerbose)) {
+                SaveConfigBoolValue("TBNLogVerbose", g_config.tbnLogVerbose);
+            }
+            ImGui::Separator();
+            ImGui::Text("draws scanned: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsScanned));
+            ImGui::Text("draws patched: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsPatched));
+            ImGui::Text("draws missing normals: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingNormals));
+            ImGui::Text("draws missing full TBN: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingFullTBN));
+            ImGui::Text("cache hits/misses: %llu / %llu", static_cast<unsigned long long>(g_tbnDiagnostics.cacheHits), static_cast<unsigned long long>(g_tbnDiagnostics.cacheMisses));
+            ImGui::Text("generation time total: %llu us", static_cast<unsigned long long>(g_tbnDiagnostics.generationTimeUs));
+            ImGui::Text("skips unsupported primitive: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsUnsupportedPrimitive));
+            ImGui::Text("skips instancing: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsInstancing));
+            ImGui::Text("skips missing position: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsMissingPosition));
+            ImGui::Text("skips missing uv: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsMissingUv));
+            ImGui::Text("skips decode failure: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsDecodeFailure));
+            ImGui::Text("skips draw too large: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsDrawTooLarge));
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("Memory Scanner")) {
             if (ImGui::Button("Start memory scan")) {
                 StartMemoryScanner();
@@ -3606,6 +3679,49 @@ public:
 /**
  * Wrapped IDirect3DDevice9 - intercepts SetVertexShaderConstantF
  */
+
+
+struct Float2 { float x, y; };
+struct Float3 { float x, y, z; };
+
+static Float3 MakeFloat3(float x, float y, float z) { Float3 v = {x,y,z}; return v; }
+static Float3 Add3(const Float3& a, const Float3& b) { return MakeFloat3(a.x+b.x,a.y+b.y,a.z+b.z); }
+static Float3 Sub3(const Float3& a, const Float3& b) { return MakeFloat3(a.x-b.x,a.y-b.y,a.z-b.z); }
+static Float3 Mul3(const Float3& a, float s) { return MakeFloat3(a.x*s,a.y*s,a.z*s); }
+static float Dot3f(const Float3& a, const Float3& b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
+static Float3 Cross3(const Float3& a, const Float3& b) { return MakeFloat3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x); }
+static float Len3(const Float3& a) { return sqrtf((std::max)(0.0f, Dot3f(a,a))); }
+static Float3 Normalize3(const Float3& a, const Float3& fallback = {0.0f,1.0f,0.0f}) {
+    const float l = Len3(a);
+    if (!std::isfinite(l) || l < 1e-12f) return fallback;
+    return Mul3(a, 1.0f / l);
+}
+
+struct TbnGeneratedVertex {
+    float nx, ny, nz;
+    float tx, ty, tz;
+    float bx, by, bz;
+};
+
+struct StreamBindingState {
+    IDirect3DVertexBuffer9* vb = nullptr;
+    UINT offset = 0;
+    UINT stride = 0;
+};
+
+struct LayoutSemanticsState {
+    bool hasPosition = false;
+    bool hasNormal = false;
+    bool hasTangent = false;
+    bool hasBinormal = false;
+    bool hasTexcoord0 = false;
+    bool fromFvf = false;
+    UINT positionOffset = 0;
+    UINT texcoord0Offset = 0;
+    UINT positionStream = 0;
+    UINT texcoord0Stream = 0;
+};
+
 class WrappedD3D9Device : public IDirect3DDevice9Ex {
 private:
     IDirect3DDevice9* m_real;
@@ -3630,6 +3746,251 @@ private:
     uintptr_t m_projLockedShader = 0;
     int m_projLockedRegister = -1;
 
+    IDirect3DVertexDeclaration9* m_currentVertexDecl = nullptr;
+    DWORD m_currentFVF = 0;
+    StreamBindingState m_streamBindings[16] = {};
+    UINT m_streamFreq[16] = {};
+    IDirect3DIndexBuffer9* m_currentIndexBuffer = nullptr;
+    IDirect3DVertexBuffer9* m_tbnGeneratedStream = nullptr;
+    UINT m_tbnGeneratedStreamCapacity = 0;
+    std::unordered_map<uintptr_t, IDirect3DVertexDeclaration9*> m_patchedDeclCache;
+
+
+    static bool IsInstancedFrequency(UINT setting) {
+        const UINT mode = setting & D3DSTREAMSOURCE_INDEXEDDATA;
+        return mode == D3DSTREAMSOURCE_INDEXEDDATA;
+    }
+
+    bool InspectLayoutSemantics(LayoutSemanticsState* out) {
+        if (!out) return false;
+        *out = {};
+        if (m_currentVertexDecl) {
+            D3DVERTEXELEMENT9 elements[MAX_FVF_DECL_SIZE] = {};
+            UINT declCount = MAX_FVF_DECL_SIZE;
+            if (FAILED(m_currentVertexDecl->GetDeclaration(elements, &declCount))) {
+                return false;
+            }
+            for (UINT i = 0; i < MAX_FVF_DECL_SIZE; ++i) {
+                const D3DVERTEXELEMENT9& e = elements[i];
+                if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
+                if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0) {
+                    out->hasPosition = true; out->positionOffset = e.Offset; out->positionStream = e.Stream;
+                } else if (e.Usage == D3DDECLUSAGE_NORMAL && e.UsageIndex == 0) {
+                    out->hasNormal = true;
+                } else if (e.Usage == D3DDECLUSAGE_TANGENT && e.UsageIndex == 0) {
+                    out->hasTangent = true;
+                } else if (e.Usage == D3DDECLUSAGE_BINORMAL && e.UsageIndex == 0) {
+                    out->hasBinormal = true;
+                } else if (e.Usage == D3DDECLUSAGE_TEXCOORD && e.UsageIndex == 0) {
+                    out->hasTexcoord0 = true; out->texcoord0Offset = e.Offset; out->texcoord0Stream = e.Stream;
+                }
+            }
+            return true;
+        }
+        if (m_currentFVF != 0) {
+            out->fromFvf = true;
+            out->hasPosition = (m_currentFVF & D3DFVF_POSITION_MASK) != 0;
+            out->hasNormal = (m_currentFVF & D3DFVF_NORMAL) != 0;
+            out->hasTexcoord0 = (m_currentFVF & D3DFVF_TEXCOUNT_MASK) != 0;
+            out->positionOffset = 0;
+            UINT offset = 12;
+            if ((m_currentFVF & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW) offset = 16;
+            if (out->hasNormal) offset += 12;
+            out->texcoord0Offset = offset;
+            return true;
+        }
+        return false;
+    }
+
+    bool BuildGeneratedTbn(const std::vector<Float3>& positions,
+                           const std::vector<Float2>& uvs,
+                           const std::vector<uint32_t>& indices,
+                           std::vector<TbnGeneratedVertex>* out) {
+        if (!out || positions.empty()) return false;
+        out->assign(positions.size(), {});
+        std::vector<Float3> nsum(positions.size(), {});
+        std::vector<Float3> tsum(positions.size(), {});
+        std::vector<float> handedness(positions.size(), 1.0f);
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            uint32_t i0 = indices[i], i1 = indices[i+1], i2 = indices[i+2];
+            if (i0 >= positions.size() || i1 >= positions.size() || i2 >= positions.size()) continue;
+            const Float3 p0 = positions[i0], p1 = positions[i1], p2 = positions[i2];
+            const Float3 e1 = Sub3(p1, p0), e2 = Sub3(p2, p0);
+            Float3 fn = Cross3(e1, e2);
+            nsum[i0] = Add3(nsum[i0], fn); nsum[i1] = Add3(nsum[i1], fn); nsum[i2] = Add3(nsum[i2], fn);
+            if (!uvs.empty() && i0 < uvs.size() && i1 < uvs.size() && i2 < uvs.size()) {
+                const Float2 w0 = uvs[i0], w1 = uvs[i1], w2 = uvs[i2];
+                const float x1 = w1.x - w0.x, x2 = w2.x - w0.x;
+                const float y1 = w1.y - w0.y, y2 = w2.y - w0.y;
+                const float denom = (x1 * y2 - x2 * y1);
+                if (fabsf(denom) > 1e-8f && std::isfinite(denom)) {
+                    const float r = 1.0f / denom;
+                    Float3 t = Mul3(Sub3(Mul3(e1, y2), Mul3(e2, y1)), r);
+                    tsum[i0] = Add3(tsum[i0], t); tsum[i1] = Add3(tsum[i1], t); tsum[i2] = Add3(tsum[i2], t);
+                    Float3 b = Mul3(Sub3(Mul3(e2, x1), Mul3(e1, x2)), r);
+                    const float s = Dot3f(Cross3(fn, t), b) < 0.0f ? -1.0f : 1.0f;
+                    handedness[i0] = s; handedness[i1] = s; handedness[i2] = s;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < positions.size(); ++i) {
+            Float3 n = Normalize3(nsum[i], MakeFloat3(0.0f, 1.0f, 0.0f));
+            Float3 t = Normalize3(Sub3(tsum[i], Mul3(n, Dot3f(n, tsum[i]))), MakeFloat3(1.0f, 0.0f, 0.0f));
+            Float3 b = Normalize3(Mul3(Cross3(n, t), handedness[i]), MakeFloat3(0.0f, 0.0f, 1.0f));
+            (*out)[i] = {n.x,n.y,n.z,t.x,t.y,t.z,b.x,b.y,b.z};
+        }
+        return true;
+    }
+
+
+    IDirect3DVertexDeclaration9* GetOrCreatePatchedDecl(bool needN, bool needT, bool needB) {
+        if (!m_currentVertexDecl) return nullptr;
+        uintptr_t key = reinterpret_cast<uintptr_t>(m_currentVertexDecl) ^ (needN?1u:0u) ^ (needT?2u:0u) ^ (needB?4u:0u);
+        auto it = m_patchedDeclCache.find(key);
+        if (it != m_patchedDeclCache.end()) {
+            g_tbnDiagnostics.cacheHits++;
+            return it->second;
+        }
+        g_tbnDiagnostics.cacheMisses++;
+        D3DVERTEXELEMENT9 src[MAX_FVF_DECL_SIZE] = {};
+        UINT declCount = MAX_FVF_DECL_SIZE;
+        if (FAILED(m_currentVertexDecl->GetDeclaration(src, &declCount))) return nullptr;
+        std::vector<D3DVERTEXELEMENT9> out;
+        for (UINT i=0;i<MAX_FVF_DECL_SIZE;++i) {
+            if (src[i].Stream == 0xFF && src[i].Type == D3DDECLTYPE_UNUSED) break;
+            out.push_back(src[i]);
+        }
+        WORD offset = 0;
+        if (needN) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0}); offset += 12; }
+        if (needT) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TANGENT, 0}); offset += 12; }
+        if (needB) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BINORMAL, 0}); offset += 12; }
+        out.push_back(D3DDECL_END());
+        IDirect3DVertexDeclaration9* patched = nullptr;
+        if (FAILED(m_real->CreateVertexDeclaration(out.data(), &patched)) || !patched) return nullptr;
+        m_patchedDeclCache[key] = patched;
+        return patched;
+    }
+
+    HRESULT TryPatchAndDrawIndexed(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT PrimitiveCount, bool* patchedOut) {
+        if (patchedOut) *patchedOut = false;
+        g_tbnDiagnostics.drawsScanned++;
+        LayoutSemanticsState layout = {};
+        if (!InspectLayoutSemantics(&layout)) return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        const bool missingN = !layout.hasNormal;
+        const bool missingT = !layout.hasTangent;
+        const bool missingB = !layout.hasBinormal;
+        if (missingN) g_tbnDiagnostics.drawsMissingNormals++;
+        if (missingN || missingT || missingB) g_tbnDiagnostics.drawsMissingFullTBN++;
+        if (!g_config.enableTBNForwarding || PrimitiveType != D3DPT_TRIANGLELIST || !m_currentVertexDecl || !m_currentIndexBuffer) {
+            if (g_config.tbnLogVerbose) LogMsg("[TBN_SKIP] forwarding disabled/unsupported path (prim=%u, decl=%p, ib=%p)", (unsigned)PrimitiveType, m_currentVertexDecl, m_currentIndexBuffer);
+            if (PrimitiveType != D3DPT_TRIANGLELIST) g_tbnDiagnostics.skipsUnsupportedPrimitive++;
+            return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        }
+        if (!layout.hasPosition || layout.positionStream >= 16 || !m_streamBindings[layout.positionStream].vb) {
+            g_tbnDiagnostics.skipsMissingPosition++;
+            return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        }
+        if ((missingT || missingB) && !layout.hasTexcoord0) {
+            g_tbnDiagnostics.skipsMissingUv++;
+            if (!g_config.generateNormalsIfMissing || !missingN) {
+                return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+            }
+        }
+        const UINT triCount = PrimitiveCount;
+        const UINT vertCount = NumVertices;
+        if (triCount > (UINT)g_config.tbnMaxTrianglesPerDraw || vertCount > (UINT)g_config.tbnMaxVerticesPerDraw) {
+            g_tbnDiagnostics.skipsDrawTooLarge++;
+            return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        }
+        for (UINT s=0;s<16;++s) {
+            if (IsInstancedFrequency(m_streamFreq[s])) { g_tbnDiagnostics.skipsInstancing++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        }
+        auto t0 = std::chrono::high_resolution_clock::now();
+        IDirect3DVertexBuffer9* vb = m_streamBindings[layout.positionStream].vb;
+        const UINT stride = m_streamBindings[layout.positionStream].stride;
+        if (stride < layout.positionOffset + 12) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        const UINT firstVertex = MinVertexIndex + (BaseVertexIndex > 0 ? (UINT)BaseVertexIndex : 0);
+        BYTE* vbData = nullptr;
+        if (FAILED(vb->Lock(m_streamBindings[layout.positionStream].offset + firstVertex * stride, vertCount * stride, (void**)&vbData, D3DLOCK_READONLY)) || !vbData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        std::vector<Float3> pos(vertCount);
+        std::vector<Float2> uv(layout.hasTexcoord0 ? vertCount : 0);
+        for (UINT i=0;i<vertCount;++i) {
+            const BYTE* v = vbData + i * stride;
+            const float* p = reinterpret_cast<const float*>(v + layout.positionOffset);
+            pos[i] = {p[0],p[1],p[2]};
+            if (layout.hasTexcoord0 && stride >= layout.texcoord0Offset + 8) {
+                const float* t = reinterpret_cast<const float*>(v + layout.texcoord0Offset);
+                uv[i] = {t[0], t[1]};
+            }
+        }
+        vb->Unlock();
+
+        D3DINDEXBUFFER_DESC ibDesc = {};
+        if (FAILED(m_currentIndexBuffer->GetDesc(&ibDesc))) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        BYTE* ibData = nullptr;
+        const UINT indexCount = triCount * 3;
+        const UINT indexStride = (ibDesc.Format == D3DFMT_INDEX16) ? 2u : 4u;
+        if (FAILED(m_currentIndexBuffer->Lock(startIndex * indexStride, indexCount * indexStride, (void**)&ibData, D3DLOCK_READONLY)) || !ibData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        std::vector<uint32_t> indices(indexCount);
+        for (UINT i=0;i<indexCount;++i) {
+            uint32_t idx = (ibDesc.Format == D3DFMT_INDEX16) ? ((const uint16_t*)ibData)[i] : ((const uint32_t*)ibData)[i];
+            if (idx < MinVertexIndex) idx = 0; else idx -= MinVertexIndex;
+            indices[i] = idx;
+        }
+        m_currentIndexBuffer->Unlock();
+
+        std::vector<TbnGeneratedVertex> generated;
+        if (!BuildGeneratedTbn(pos, uv, indices, &generated)) { g_tbnDiagnostics.skipsDecodeFailure++; if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generation failed"); return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generated attributes for %u vertices", vertCount);
+        const bool needN = missingN && g_config.generateNormalsIfMissing;
+        const bool needT = missingT && g_config.generateTangentsIfMissing && layout.hasTexcoord0;
+        const bool needB = missingB && g_config.generateBinormalsIfMissing && layout.hasTexcoord0;
+        if (!needN && !needT && !needB) return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        IDirect3DVertexDeclaration9* patchedDecl = GetOrCreatePatchedDecl(needN, needT, needB);
+        if (!patchedDecl) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+
+        UINT outStride = (needN?12:0) + (needT?12:0) + (needB?12:0);
+        if (!m_tbnGeneratedStream || m_tbnGeneratedStreamCapacity < outStride * vertCount) {
+            if (m_tbnGeneratedStream) { m_tbnGeneratedStream->Release(); m_tbnGeneratedStream = nullptr; }
+            if (FAILED(m_real->CreateVertexBuffer((std::max)(UINT(4096), outStride * vertCount), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &m_tbnGeneratedStream, nullptr)) || !m_tbnGeneratedStream) {
+                g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+            }
+            m_tbnGeneratedStreamCapacity = (std::max)(UINT(4096), outStride * vertCount);
+        }
+        BYTE* outData = nullptr;
+        if (FAILED(m_tbnGeneratedStream->Lock(0, outStride * vertCount, (void**)&outData, D3DLOCK_DISCARD)) || !outData) {
+            g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        }
+        for (UINT i=0;i<vertCount;++i) {
+            BYTE* v = outData + i*outStride;
+            UINT o=0;
+            if (needN) { memcpy(v+o, &generated[i].nx, 12); o+=12; }
+            if (needT) { memcpy(v+o, &generated[i].tx, 12); o+=12; }
+            if (needB) { memcpy(v+o, &generated[i].bx, 12); o+=12; }
+        }
+        m_tbnGeneratedStream->Unlock();
+
+        IDirect3DVertexDeclaration9* prevDecl = m_currentVertexDecl;
+        IDirect3DVertexBuffer9* prevStream1 = m_streamBindings[1].vb;
+        UINT prevOffset1 = m_streamBindings[1].offset;
+        UINT prevStride1 = m_streamBindings[1].stride;
+        m_real->SetVertexDeclaration(patchedDecl);
+        m_real->SetStreamSource(1, m_tbnGeneratedStream, 0, outStride);
+        HRESULT hr = m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
+        m_real->SetStreamSource(1, prevStream1, prevOffset1, prevStride1);
+        m_real->SetVertexDeclaration(prevDecl);
+        if (SUCCEEDED(hr)) {
+            g_tbnDiagnostics.drawsPatched++;
+            if (g_config.tbnLogVerbose) LogMsg("[TBN_PATCH] Patched indexed triangle draw: verts=%u tris=%u needN=%d needT=%d needB=%d", vertCount, triCount, needN ? 1 : 0, needT ? 1 : 0, needB ? 1 : 0);
+            if (patchedOut) *patchedOut = true;
+            auto t1 = std::chrono::high_resolution_clock::now();
+            g_tbnDiagnostics.generationTimeUs += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+        }
+        return hr;
+    }
+
+
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
         if (m_real) {
@@ -3651,6 +4012,16 @@ public:
     }
 
     ~WrappedD3D9Device() {
+        if (m_currentVertexDecl) { m_currentVertexDecl->Release(); m_currentVertexDecl = nullptr; }
+        if (m_currentIndexBuffer) { m_currentIndexBuffer->Release(); m_currentIndexBuffer = nullptr; }
+        if (m_tbnGeneratedStream) { m_tbnGeneratedStream->Release(); m_tbnGeneratedStream = nullptr; }
+        for (UINT i = 0; i < 16; ++i) {
+            if (m_streamBindings[i].vb) { m_streamBindings[i].vb->Release(); m_streamBindings[i].vb = nullptr; }
+        }
+        for (auto& it : m_patchedDeclCache) {
+            if (it.second) it.second->Release();
+        }
+        m_patchedDeclCache.clear();
         if (m_realEx) {
             m_realEx->Release();
             m_realEx = nullptr;
@@ -4875,6 +5246,12 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        g_tbnDiagnostics.drawsScanned++;
+        LayoutSemanticsState layout = {};
+        if (InspectLayoutSemantics(&layout)) {
+            if (!layout.hasNormal) g_tbnDiagnostics.drawsMissingNormals++;
+            if (!layout.hasNormal || !layout.hasTangent || !layout.hasBinormal) g_tbnDiagnostics.drawsMissingFullTBN++;
+        }
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
@@ -4882,13 +5259,15 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
-        return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+        bool patched = false;
+        return TryPatchAndDrawIndexed(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount, &patched);
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        g_tbnDiagnostics.drawsScanned++;
         return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
@@ -4896,13 +5275,14 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        g_tbnDiagnostics.drawsScanned++;
         return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override { return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
     HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(const D3DVERTEXELEMENT9* pVertexElements, IDirect3DVertexDeclaration9** ppDecl) override { return m_real->CreateVertexDeclaration(pVertexElements, ppDecl); }
-    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { return m_real->SetVertexDeclaration(pDecl); }
+    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { if (pDecl) pDecl->AddRef(); if (m_currentVertexDecl) m_currentVertexDecl->Release(); m_currentVertexDecl = pDecl; return m_real->SetVertexDeclaration(pDecl); }
     HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** ppDecl) override { return m_real->GetVertexDeclaration(ppDecl); }
-    HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
+    HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { m_currentFVF = FVF; if (m_currentVertexDecl) { m_currentVertexDecl->Release(); m_currentVertexDecl = nullptr; } return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
     HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override {
         if (!ppShader) {
@@ -4940,11 +5320,11 @@ public:
     HRESULT STDMETHODCALLTYPE GetVertexShaderConstantI(UINT StartRegister, int* pConstantData, UINT Vector4iCount) override { return m_real->GetVertexShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
     HRESULT STDMETHODCALLTYPE SetVertexShaderConstantB(UINT StartRegister, const BOOL* pConstantData, UINT BoolCount) override { return m_real->SetVertexShaderConstantB(StartRegister, pConstantData, BoolCount); }
     HRESULT STDMETHODCALLTYPE GetVertexShaderConstantB(UINT StartRegister, BOOL* pConstantData, UINT BoolCount) override { return m_real->GetVertexShaderConstantB(StartRegister, pConstantData, BoolCount); }
-    HRESULT STDMETHODCALLTYPE SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData, UINT OffsetInBytes, UINT Stride) override { return m_real->SetStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride); }
+    HRESULT STDMETHODCALLTYPE SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData, UINT OffsetInBytes, UINT Stride) override { if (StreamNumber < 16) { if (pStreamData) pStreamData->AddRef(); if (m_streamBindings[StreamNumber].vb) m_streamBindings[StreamNumber].vb->Release(); m_streamBindings[StreamNumber].vb = pStreamData; m_streamBindings[StreamNumber].offset = OffsetInBytes; m_streamBindings[StreamNumber].stride = Stride; } return m_real->SetStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride); }
     HRESULT STDMETHODCALLTYPE GetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9** ppStreamData, UINT* pOffsetInBytes, UINT* pStride) override { return m_real->GetStreamSource(StreamNumber, ppStreamData, pOffsetInBytes, pStride); }
-    HRESULT STDMETHODCALLTYPE SetStreamSourceFreq(UINT StreamNumber, UINT Setting) override { return m_real->SetStreamSourceFreq(StreamNumber, Setting); }
+    HRESULT STDMETHODCALLTYPE SetStreamSourceFreq(UINT StreamNumber, UINT Setting) override { if (StreamNumber < 16) m_streamFreq[StreamNumber] = Setting; return m_real->SetStreamSourceFreq(StreamNumber, Setting); }
     HRESULT STDMETHODCALLTYPE GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) override { return m_real->GetStreamSourceFreq(StreamNumber, pSetting); }
-    HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { return m_real->SetIndices(pIndexData); }
+    HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { if (pIndexData) pIndexData->AddRef(); if (m_currentIndexBuffer) m_currentIndexBuffer->Release(); m_currentIndexBuffer = pIndexData; return m_real->SetIndices(pIndexData); }
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData) override { return m_real->GetIndices(ppIndexData); }
     HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override { return m_real->CreatePixelShader(pFunction, ppShader); }
     HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
@@ -5277,6 +5657,14 @@ void LoadConfig() {
     g_config.combinedMVPAssumeIdentityWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPAssumeIdentityWorld", 1, path) != 0;
     g_config.combinedMVPForceDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPForceDecomposition", 0, path) != 0;
     g_config.combinedMVPLogDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPLogDecomposition", 0, path) != 0;
+
+    g_config.enableTBNForwarding = GetPrivateProfileIntA("CameraProxy", "EnableTBNForwarding", 0, path) != 0;
+    g_config.generateNormalsIfMissing = GetPrivateProfileIntA("CameraProxy", "GenerateNormalsIfMissing", 1, path) != 0;
+    g_config.generateTangentsIfMissing = GetPrivateProfileIntA("CameraProxy", "GenerateTangentsIfMissing", 0, path) != 0;
+    g_config.generateBinormalsIfMissing = GetPrivateProfileIntA("CameraProxy", "GenerateBinormalsIfMissing", 0, path) != 0;
+    g_config.tbnMaxVerticesPerDraw = GetPrivateProfileIntA("CameraProxy", "TBNMaxVerticesPerDraw", 65535, path);
+    g_config.tbnMaxTrianglesPerDraw = GetPrivateProfileIntA("CameraProxy", "TBNMaxTrianglesPerDraw", 65535, path);
+    g_config.tbnLogVerbose = GetPrivateProfileIntA("CameraProxy", "TBNLogVerbose", 0, path) != 0;
 
     g_config.experimentalCustomProjectionEnabled =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionEnabled", 0, path) != 0;

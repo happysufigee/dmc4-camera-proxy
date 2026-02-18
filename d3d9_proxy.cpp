@@ -30,6 +30,14 @@
 #include <cstdint>
 #include <cstring>
 
+#ifndef MAXD3DDECLLENGTH
+#define MAXD3DDECLLENGTH 64
+#endif
+
+#ifndef MAX_FVF_DECL_SIZE
+#define MAX_FVF_DECL_SIZE (MAXD3DDECLLENGTH + 1)
+#endif
+
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
 

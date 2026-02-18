@@ -3766,12 +3766,12 @@ private:
         if (!out) return false;
         *out = {};
         if (m_currentVertexDecl) {
-            D3DVERTEXELEMENT9 elements[MAX_FVF_DECL_SIZE] = {};
-            UINT declCount = MAX_FVF_DECL_SIZE;
+            D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH] = {};
+            UINT declCount = MAXD3DDECLLENGTH;
             if (FAILED(m_currentVertexDecl->GetDeclaration(elements, &declCount))) {
                 return false;
             }
-            for (UINT i = 0; i < MAX_FVF_DECL_SIZE; ++i) {
+            for (UINT i = 0; i < MAXD3DDECLLENGTH; ++i) {
                 const D3DVERTEXELEMENT9& e = elements[i];
                 if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
                 if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0) {
@@ -3845,44 +3845,27 @@ private:
     }
 
 
-    IDirect3DVertexDeclaration9* GetOrCreatePatchedDecl(bool needN, bool needT, bool needB, UINT* outAppendStream) {
+    IDirect3DVertexDeclaration9* GetOrCreatePatchedDecl(bool needN, bool needT, bool needB) {
         if (!m_currentVertexDecl) return nullptr;
-        D3DVERTEXELEMENT9 src[MAX_FVF_DECL_SIZE] = {};
-        UINT declCount = MAX_FVF_DECL_SIZE;
-        if (FAILED(m_currentVertexDecl->GetDeclaration(src, &declCount))) return nullptr;
-
-        bool streamUsed[16] = {};
-        for (UINT i=0;i<MAX_FVF_DECL_SIZE;++i) {
-            if (src[i].Stream == 0xFF && src[i].Type == D3DDECLTYPE_UNUSED) break;
-            if (src[i].Stream < 16) streamUsed[src[i].Stream] = true;
-        }
-
-        UINT appendStream = 16;
-        for (UINT s = 0; s < 16; ++s) {
-            if (!streamUsed[s]) { appendStream = s; break; }
-        }
-        if (appendStream >= 16) {
-            return nullptr;
-        }
-        if (outAppendStream) *outAppendStream = appendStream;
-
-        uintptr_t key = reinterpret_cast<uintptr_t>(m_currentVertexDecl) ^ (needN?1u:0u) ^ (needT?2u:0u) ^ (needB?4u:0u) ^ (uintptr_t(appendStream) << 8);
+        uintptr_t key = reinterpret_cast<uintptr_t>(m_currentVertexDecl) ^ (needN?1u:0u) ^ (needT?2u:0u) ^ (needB?4u:0u);
         auto it = m_patchedDeclCache.find(key);
         if (it != m_patchedDeclCache.end()) {
             g_tbnDiagnostics.cacheHits++;
             return it->second;
         }
         g_tbnDiagnostics.cacheMisses++;
-
+        D3DVERTEXELEMENT9 src[MAXD3DDECLLENGTH] = {};
+        UINT declCount = MAXD3DDECLLENGTH;
+        if (FAILED(m_currentVertexDecl->GetDeclaration(src, &declCount))) return nullptr;
         std::vector<D3DVERTEXELEMENT9> out;
-        for (UINT i=0;i<MAX_FVF_DECL_SIZE;++i) {
+        for (UINT i=0;i<MAXD3DDECLLENGTH;++i) {
             if (src[i].Stream == 0xFF && src[i].Type == D3DDECLTYPE_UNUSED) break;
             out.push_back(src[i]);
         }
         WORD offset = 0;
-        if (needN) { out.push_back({static_cast<WORD>(appendStream), offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0}); offset += 12; }
-        if (needT) { out.push_back({static_cast<WORD>(appendStream), offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TANGENT, 0}); offset += 12; }
-        if (needB) { out.push_back({static_cast<WORD>(appendStream), offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BINORMAL, 0}); offset += 12; }
+        if (needN) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0}); offset += 12; }
+        if (needT) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TANGENT, 0}); offset += 12; }
+        if (needB) { out.push_back({1, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BINORMAL, 0}); offset += 12; }
         out.push_back(D3DDECL_END());
         IDirect3DVertexDeclaration9* patched = nullptr;
         if (FAILED(m_real->CreateVertexDeclaration(out.data(), &patched)) || !patched) return nullptr;
@@ -3900,9 +3883,6 @@ private:
         const bool missingB = !layout.hasBinormal;
         if (missingN) g_tbnDiagnostics.drawsMissingNormals++;
         if (missingN || missingT || missingB) g_tbnDiagnostics.drawsMissingFullTBN++;
-        if (g_config.tbnLogVerbose) {
-            LogMsg("[TBN_SCAN] prim=%u missing N/T/B = %d/%d/%d", (unsigned)PrimitiveType, missingN ? 1 : 0, missingT ? 1 : 0, missingB ? 1 : 0);
-        }
         if (!g_config.enableTBNForwarding || PrimitiveType != D3DPT_TRIANGLELIST || !m_currentVertexDecl || !m_currentIndexBuffer) {
             if (g_config.tbnLogVerbose) LogMsg("[TBN_SKIP] forwarding disabled/unsupported path (prim=%u, decl=%p, ib=%p)", (unsigned)PrimitiveType, m_currentVertexDecl, m_currentIndexBuffer);
             if (PrimitiveType != D3DPT_TRIANGLELIST) g_tbnDiagnostics.skipsUnsupportedPrimitive++;
@@ -3928,41 +3908,24 @@ private:
             if (IsInstancedFrequency(m_streamFreq[s])) { g_tbnDiagnostics.skipsInstancing++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         }
         auto t0 = std::chrono::high_resolution_clock::now();
-        IDirect3DVertexBuffer9* posVb = m_streamBindings[layout.positionStream].vb;
-        const UINT posStride = m_streamBindings[layout.positionStream].stride;
-        if (posStride < layout.positionOffset + 12) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
-        const int baseMinVertex = BaseVertexIndex + static_cast<int>(MinVertexIndex);
-        if (baseMinVertex < 0) {
-            g_tbnDiagnostics.skipsDecodeFailure++;
-            return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-        }
-        BYTE* posData = nullptr;
-        if (FAILED(posVb->Lock(m_streamBindings[layout.positionStream].offset + static_cast<UINT>(baseMinVertex) * posStride, vertCount * posStride, (void**)&posData, D3DLOCK_READONLY)) || !posData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        IDirect3DVertexBuffer9* vb = m_streamBindings[layout.positionStream].vb;
+        const UINT stride = m_streamBindings[layout.positionStream].stride;
+        if (stride < layout.positionOffset + 12) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
+        const UINT firstVertex = MinVertexIndex + (BaseVertexIndex > 0 ? (UINT)BaseVertexIndex : 0);
+        BYTE* vbData = nullptr;
+        if (FAILED(vb->Lock(m_streamBindings[layout.positionStream].offset + firstVertex * stride, vertCount * stride, (void**)&vbData, D3DLOCK_READONLY)) || !vbData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         std::vector<Float3> pos(vertCount);
+        std::vector<Float2> uv(layout.hasTexcoord0 ? vertCount : 0);
         for (UINT i=0;i<vertCount;++i) {
-            const BYTE* v = posData + i * posStride;
+            const BYTE* v = vbData + i * stride;
             const float* p = reinterpret_cast<const float*>(v + layout.positionOffset);
             pos[i] = {p[0],p[1],p[2]};
-        }
-        posVb->Unlock();
-
-        std::vector<Float2> uv;
-        if (layout.hasTexcoord0 && layout.texcoord0Stream < 16 && m_streamBindings[layout.texcoord0Stream].vb) {
-            IDirect3DVertexBuffer9* uvVb = m_streamBindings[layout.texcoord0Stream].vb;
-            const UINT uvStride = m_streamBindings[layout.texcoord0Stream].stride;
-            if (uvStride >= layout.texcoord0Offset + 8) {
-                BYTE* uvData = nullptr;
-                if (SUCCEEDED(uvVb->Lock(m_streamBindings[layout.texcoord0Stream].offset + static_cast<UINT>(baseMinVertex) * uvStride, vertCount * uvStride, (void**)&uvData, D3DLOCK_READONLY)) && uvData) {
-                    uv.resize(vertCount);
-                    for (UINT i=0;i<vertCount;++i) {
-                        const BYTE* v = uvData + i * uvStride;
-                        const float* t = reinterpret_cast<const float*>(v + layout.texcoord0Offset);
-                        uv[i] = {t[0], t[1]};
-                    }
-                    uvVb->Unlock();
-                }
+            if (layout.hasTexcoord0 && stride >= layout.texcoord0Offset + 8) {
+                const float* t = reinterpret_cast<const float*>(v + layout.texcoord0Offset);
+                uv[i] = {t[0], t[1]};
             }
         }
+        vb->Unlock();
 
         D3DINDEXBUFFER_DESC ibDesc = {};
         if (FAILED(m_currentIndexBuffer->GetDesc(&ibDesc))) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
@@ -3972,34 +3935,20 @@ private:
         if (FAILED(m_currentIndexBuffer->Lock(startIndex * indexStride, indexCount * indexStride, (void**)&ibData, D3DLOCK_READONLY)) || !ibData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         std::vector<uint32_t> indices(indexCount);
         for (UINT i=0;i<indexCount;++i) {
-            int idx = (ibDesc.Format == D3DFMT_INDEX16) ? int(((const uint16_t*)ibData)[i]) : int(((const uint32_t*)ibData)[i]);
-            idx += BaseVertexIndex;
-            idx -= static_cast<int>(MinVertexIndex);
-            if (idx < 0 || static_cast<UINT>(idx) >= vertCount) {
-                m_currentIndexBuffer->Unlock();
-                g_tbnDiagnostics.skipsDecodeFailure++;
-                return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-            }
-            indices[i] = static_cast<uint32_t>(idx);
+            uint32_t idx = (ibDesc.Format == D3DFMT_INDEX16) ? ((const uint16_t*)ibData)[i] : ((const uint32_t*)ibData)[i];
+            if (idx < MinVertexIndex) idx = 0; else idx -= MinVertexIndex;
+            indices[i] = idx;
         }
         m_currentIndexBuffer->Unlock();
 
-        const bool uvUsable = !uv.empty();
         std::vector<TbnGeneratedVertex> generated;
         if (!BuildGeneratedTbn(pos, uv, indices, &generated)) { g_tbnDiagnostics.skipsDecodeFailure++; if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generation failed"); return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generated attributes for %u vertices", vertCount);
         const bool needN = missingN && g_config.generateNormalsIfMissing;
-        const bool needT = missingT && g_config.generateTangentsIfMissing && uvUsable;
-        const bool needB = missingB && g_config.generateBinormalsIfMissing && uvUsable;
-        if ((missingT && g_config.generateTangentsIfMissing) || (missingB && g_config.generateBinormalsIfMissing)) {
-            if (!uvUsable) {
-                g_tbnDiagnostics.skipsMissingUv++;
-                if (g_config.tbnLogVerbose) LogMsg("[TBN_SKIP] UV data unavailable/invalid for tangent-space generation");
-            }
-        }
+        const bool needT = missingT && g_config.generateTangentsIfMissing && layout.hasTexcoord0;
+        const bool needB = missingB && g_config.generateBinormalsIfMissing && layout.hasTexcoord0;
         if (!needN && !needT && !needB) return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-        UINT appendStream = 0;
-        IDirect3DVertexDeclaration9* patchedDecl = GetOrCreatePatchedDecl(needN, needT, needB, &appendStream);
+        IDirect3DVertexDeclaration9* patchedDecl = GetOrCreatePatchedDecl(needN, needT, needB);
         if (!patchedDecl) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
 
         UINT outStride = (needN?12:0) + (needT?12:0) + (needB?12:0);
@@ -4024,13 +3973,13 @@ private:
         m_tbnGeneratedStream->Unlock();
 
         IDirect3DVertexDeclaration9* prevDecl = m_currentVertexDecl;
-        IDirect3DVertexBuffer9* prevStream = (appendStream < 16) ? m_streamBindings[appendStream].vb : nullptr;
-        UINT prevOffset = (appendStream < 16) ? m_streamBindings[appendStream].offset : 0;
-        UINT prevStride = (appendStream < 16) ? m_streamBindings[appendStream].stride : 0;
+        IDirect3DVertexBuffer9* prevStream1 = m_streamBindings[1].vb;
+        UINT prevOffset1 = m_streamBindings[1].offset;
+        UINT prevStride1 = m_streamBindings[1].stride;
         m_real->SetVertexDeclaration(patchedDecl);
-        m_real->SetStreamSource(appendStream, m_tbnGeneratedStream, 0, outStride);
+        m_real->SetStreamSource(1, m_tbnGeneratedStream, 0, outStride);
         HRESULT hr = m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-        m_real->SetStreamSource(appendStream, prevStream, prevOffset, prevStride);
+        m_real->SetStreamSource(1, prevStream1, prevOffset1, prevStride1);
         m_real->SetVertexDeclaration(prevDecl);
         if (SUCCEEDED(hr)) {
             g_tbnDiagnostics.drawsPatched++;

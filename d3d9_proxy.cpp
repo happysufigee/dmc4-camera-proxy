@@ -3679,22 +3679,12 @@ public:
                 return;
             }
 
-            D3DMATRIX worldToEmit = m_currentWorld;
             g_lastInverseViewAsWorldEligible = false;
             g_lastInverseViewAsWorldApplied = false;
             g_lastInverseViewAsWorldUsedFast = false;
-            if (g_config.experimentalInverseViewAsWorld) {
-                const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
-                g_lastInverseViewAsWorldEligible = viewLooksValid;
-                if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
-                    if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
-                                              &worldToEmit, &g_lastInverseViewAsWorldUsedFast, nullptr)) {
-                        g_lastInverseViewAsWorldApplied = true;
-                    }
-                }
-            }
 
-            m_real->SetTransform(D3DTS_WORLD, &worldToEmit);
+            // Keep MGR strict and deterministic: WORLD always comes from c16-c19.
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
@@ -4075,7 +4065,6 @@ public:
                     D3DMATRIX projectionInv = {};
                     if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
                         D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
-                        OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
                         m_hasView = true;
                 m_viewLastFrame = g_frameCount;

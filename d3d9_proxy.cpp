@@ -47,7 +47,6 @@ static void LogMsg(const char* fmt, ...);
 static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
-static float Dot3(float ax, float ay, float az, float bx, float by, float bz);
 
 enum ProjectionHandedness {
     ProjectionHandedness_Unknown = 0,
@@ -3766,12 +3765,12 @@ private:
         if (!out) return false;
         *out = {};
         if (m_currentVertexDecl) {
-            D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH] = {};
-            UINT declCount = MAXD3DDECLLENGTH;
+            D3DVERTEXELEMENT9 elements[MAX_FVF_DECL_SIZE] = {};
+            UINT declCount = MAX_FVF_DECL_SIZE;
             if (FAILED(m_currentVertexDecl->GetDeclaration(elements, &declCount))) {
                 return false;
             }
-            for (UINT i = 0; i < MAXD3DDECLLENGTH; ++i) {
+            for (UINT i = 0; i < MAX_FVF_DECL_SIZE; ++i) {
                 const D3DVERTEXELEMENT9& e = elements[i];
                 if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
                 if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0) {
@@ -3854,11 +3853,11 @@ private:
             return it->second;
         }
         g_tbnDiagnostics.cacheMisses++;
-        D3DVERTEXELEMENT9 src[MAXD3DDECLLENGTH] = {};
-        UINT declCount = MAXD3DDECLLENGTH;
+        D3DVERTEXELEMENT9 src[MAX_FVF_DECL_SIZE] = {};
+        UINT declCount = MAX_FVF_DECL_SIZE;
         if (FAILED(m_currentVertexDecl->GetDeclaration(src, &declCount))) return nullptr;
         std::vector<D3DVERTEXELEMENT9> out;
-        for (UINT i=0;i<MAXD3DDECLLENGTH;++i) {
+        for (UINT i=0;i<MAX_FVF_DECL_SIZE;++i) {
             if (src[i].Stream == 0xFF && src[i].Type == D3DDECLTYPE_UNUSED) break;
             out.push_back(src[i]);
         }

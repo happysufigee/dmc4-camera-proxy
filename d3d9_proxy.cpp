@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <winver.h>
 #include <cstdio>
 #include <cmath>
 #include <unordered_map>
@@ -46,6 +47,8 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
 
 static float Dot3(float ax, float ay, float az, float bx, float by, float bz);
+static void CopyFilenameFromPath(const char* fullPath, char* outName, size_t outNameSize);
+static bool TryReadFileDescription(const char* exePath, char* outDescription, size_t outDescriptionSize);
 
 enum ProjectionHandedness {
     ProjectionHandedness_Unknown = 0,
@@ -71,6 +74,9 @@ void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "version.lib")
+
+static const char* kCameraProxyVersion = "Camera Proxy v0.2.0 experimental branch";
 
 // Configuration
 struct ProxyConfig {
@@ -179,6 +185,9 @@ static HINSTANCE g_moduleInstance = nullptr;
 static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
+static char g_gameExePath[MAX_PATH] = "";
+static char g_gameExeName[MAX_PATH] = "";
+static char g_gameDisplayName[256] = "";
 
 struct CameraMatrices {
     D3DMATRIX view;
@@ -2007,6 +2016,9 @@ static void RenderImGuiOverlay() {
     ImGui::Begin("Camera Proxy for RTX Remix", nullptr,
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
+    ImGui::Text("%s", kCameraProxyVersion);
+    ImGui::Text("Game exe: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
+    ImGui::Text("Game name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
     ImGui::Text("Hotkeys: Toggle menu(F10) Pause(F9) Emit matrices(F8) Reset matrix overrides(F7)");
     if (ImGui::Button(g_pauseRendering ? "Resume game rendering" : "Pause game rendering")) {
         g_pauseRendering = !g_pauseRendering;
@@ -5188,9 +5200,18 @@ public:
 
 // Load configuration from ini file
 void LoadConfig() {
-    char path[MAX_PATH];
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
 
+    snprintf(g_gameExePath, sizeof(g_gameExePath), "%s", exePath);
+    CopyFilenameFromPath(g_gameExePath, g_gameExeName, sizeof(g_gameExeName));
+    if (!TryReadFileDescription(g_gameExePath, g_gameDisplayName, sizeof(g_gameDisplayName))) {
+        snprintf(g_gameDisplayName, sizeof(g_gameDisplayName), "%s",
+                 g_gameExeName[0] ? g_gameExeName : "<unknown>");
+    }
+
+    char path[MAX_PATH] = {};
+    snprintf(path, sizeof(path), "%s", exePath);
     char* lastSlash = strrchr(path, '\\');
     if (lastSlash) {
         strcpy(lastSlash + 1, "camera_proxy.ini");
@@ -5320,7 +5341,10 @@ static void EnsureProxyInitialized() {
         LoadConfig();
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
-            LogMsg("=== DMC4 Camera Proxy for D3D9 ===");
+            LogMsg("=== %s ===", kCameraProxyVersion);
+            LogMsg("Game executable path: %s", g_gameExePath[0] ? g_gameExePath : "<unknown>");
+            LogMsg("Game executable name: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
+            LogMsg("Game display name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
         }
         g_hD3D9 = LoadTargetD3D9();
         if (g_hD3D9) {
@@ -5335,6 +5359,55 @@ static void EnsureProxyInitialized() {
             g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
         }
     });
+}
+
+static void CopyFilenameFromPath(const char* fullPath, char* outName, size_t outNameSize) {
+    if (!outName || outNameSize == 0) return;
+    outName[0] = '\0';
+    if (!fullPath || !fullPath[0]) return;
+
+    const char* lastSlash = strrchr(fullPath, '\\');
+    const char* filename = lastSlash ? (lastSlash + 1) : fullPath;
+    snprintf(outName, outNameSize, "%s", filename);
+}
+
+static bool TryReadFileDescription(const char* exePath, char* outDescription, size_t outDescriptionSize) {
+    if (!exePath || !exePath[0] || !outDescription || outDescriptionSize == 0) return false;
+    outDescription[0] = '\0';
+
+    DWORD handle = 0;
+    DWORD infoSize = GetFileVersionInfoSizeA(exePath, &handle);
+    if (infoSize == 0) return false;
+
+    std::vector<unsigned char> infoData(infoSize);
+    if (!GetFileVersionInfoA(exePath, 0, infoSize, infoData.data())) return false;
+
+    struct LangAndCodepage {
+        WORD language;
+        WORD codePage;
+    };
+
+    LangAndCodepage* translate = nullptr;
+    UINT translateSize = 0;
+    if (!VerQueryValueA(infoData.data(), "\\VarFileInfo\\Translation",
+                        reinterpret_cast<void**>(&translate), &translateSize) ||
+        !translate || translateSize < sizeof(LangAndCodepage)) {
+        return false;
+    }
+
+    char queryPath[64] = {};
+    snprintf(queryPath, sizeof(queryPath), "\\StringFileInfo\\%04x%04x\\FileDescription",
+             translate[0].language, translate[0].codePage);
+
+    char* value = nullptr;
+    UINT valueSize = 0;
+    if (!VerQueryValueA(infoData.data(), queryPath, reinterpret_cast<void**>(&value), &valueSize) ||
+        !value || valueSize <= 1) {
+        return false;
+    }
+
+    snprintf(outDescription, outDescriptionSize, "%s", value);
+    return true;
 }
 
 // DLL entry point

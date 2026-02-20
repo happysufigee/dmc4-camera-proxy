@@ -2834,20 +2834,21 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 if (!recPtr) continue;
                 ShaderRecord& rec = *recPtr;
                 const uintptr_t shaderKey = rec.shaderKey;
-                char label[256];
-                snprintf(label, sizeof(label), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
+                char visibleLabel[256];
+                snprintf(visibleLabel, sizeof(visibleLabel), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
                          rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
                          static_cast<int>(rec.ir.size()), rec.usageCount,
                          (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
-                if (shaderFilter[0] && strstr(label, shaderFilter) == nullptr) continue;
+                if (shaderFilter[0] && strstr(visibleLabel, shaderFilter) == nullptr) continue;
                 bool selected = (shaderKey == g_selectedShaderKey);
-                ImGui::PushID(reinterpret_cast<void*>(shaderKey));
-                if (ImGui::Selectable((std::string(label) + "##shader_row").c_str(), selected)) {
+                char selectableLabel[320];
+                snprintf(selectableLabel, sizeof(selectableLabel), "%s###shader_row_%p", visibleLabel,
+                         reinterpret_cast<void*>(shaderKey));
+                if (ImGui::Selectable(selectableLabel, selected)) {
                     g_selectedShaderHash = static_cast<uint64_t>(rec.hash);
                     g_selectedShaderKey = shaderKey;
                     g_selectedRegister = -1;
                 }
-                ImGui::PopID();
             }
             ImGui::EndChild();
 

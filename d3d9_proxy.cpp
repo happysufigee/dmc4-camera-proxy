@@ -2924,7 +2924,7 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndChild();
 
             ImGui::NextColumn();
-            ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true);
+            ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
             auto ai = g_shaderRecords.find(g_selectedShaderKey);
             if (ai != g_shaderRecords.end() && static_cast<uint64_t>(ai->second.hash) == g_selectedShaderHash) {
                 ShaderRecord& rec = ai->second;
@@ -2941,7 +2941,20 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
                 ImGui::Text("Transform base: c%d", effectiveTransformBase);
                 ImGui::Text("Lighting: %s", rec.isFFPLighting ? "Yes" : "No");
+                ImGui::Text("Skinning: %s", rec.usesSkinning ? "Yes" : "No");
+                ImGui::Text("Flow control: %s", rec.usesFlowControl ? "Yes" : "No");
+                ImGui::Text("Remix safe: %s", rec.isRemixSafe ? "Yes" : "No");
                 ImGui::Text("Lighting base: c%d", effectiveLightingBase);
+
+                ImGui::Separator();
+                ImGui::Text("Vertex input");
+                ImGui::Text("POSITION: %s", g_activeVertexDeclInfo.hasPosition ? "Yes" : "No");
+                ImGui::Text("NORMAL: %s", g_activeVertexDeclInfo.hasNormal ? "Yes" : "No");
+                ImGui::Text("TEXCOORDS: %d", g_activeVertexDeclInfo.texcoordCount);
+                ImGui::Text("TANGENT: %s", g_activeVertexDeclInfo.hasTangent ? "Yes" : "No");
+                ImGui::Text("BINORMAL: %s", g_activeVertexDeclInfo.hasBinormal ? "Yes" : "No");
+
+                ImGui::Separator();
                 ImGui::Text("Used const range: %s", usedMin >= 0 ? "captured" : "none");
                 if (usedMin >= 0) {
                     ImGui::SameLine();

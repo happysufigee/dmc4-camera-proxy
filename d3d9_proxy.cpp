@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3dcommon.h>
 #include <winver.h>
 #include <cstdio>
 #include <cmath>
@@ -5267,8 +5268,8 @@ public:
     HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override {
         g_activeVertexDeclInfo = {};
         if (pDecl) {
-            D3DVERTEXELEMENT9 elems[MAX_FVF_DECL_SIZE] = {};
-            UINT num = MAX_FVF_DECL_SIZE;
+            D3DVERTEXELEMENT9 elems[MAXD3DDECLLENGTH] = {};
+            UINT num = MAXD3DDECLLENGTH;
             if (SUCCEEDED(pDecl->GetDeclaration(elems, &num))) {
                 for (UINT i = 0; i < num; ++i) {
                     const D3DVERTEXELEMENT9& e = elems[i];

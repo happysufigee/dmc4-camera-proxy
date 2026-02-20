@@ -427,7 +427,7 @@ static std::vector<std::string> SplitAsmOperands(const std::string& text) {
     int depth = 0;
     for (char ch : text) {
         if (ch == '[') ++depth;
-        if (ch == ']') depth = std::max(0, depth - 1);
+        if (ch == ']') depth = (depth > 0) ? (depth - 1) : 0;
         if (ch == ',' && depth == 0) {
             std::string token = TrimCopy(current);
             if (!token.empty()) out.push_back(token);

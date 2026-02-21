@@ -19,7 +19,7 @@ if errorlevel 1 (
 REM Build 32-bit DLL (DMC4 is 32-bit)
 echo.
 echo Compiling for x86 (32-bit)...
-cl /LD /EHsc /O2 /MD d3d9_proxy.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
+cl /LD /EHsc /O2 /MD d3d9_proxy.cpp remix_interface.cpp remix_lighting_manager.cpp lights_tab_ui.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
 
 if errorlevel 1 (
     echo.

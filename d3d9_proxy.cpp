@@ -42,6 +42,8 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_dx9.h"
 #include "imgui/backends/imgui_impl_win32.h"
+#include "remix_lighting_manager.h"
+#include "lights_tab_ui.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -359,6 +361,12 @@ struct ShaderRecord {
     bool isRemixSafe = false;
     int transformConstantBase = -1;
     int lightingConstantBase = -1;
+    int lightDirectionRegister = -1;
+    int lightColorRegister = -1;
+    int materialColorRegister = -1;
+    int attenuationRegister = -1;
+    int positionRegister = -1;
+    LightingSpace lightSpace = LightingSpace::World;
     bool constantUsage[kMaxConstantRegisters] = {};
     unsigned long long usageCount = 0;
     IUnknown* replacementShader = nullptr;
@@ -639,6 +647,12 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->usesFlowControl = false;
     rec->transformConstantBase = -1;
     rec->lightingConstantBase = -1;
+    rec->lightDirectionRegister = -1;
+    rec->lightColorRegister = -1;
+    rec->materialColorRegister = -1;
+    rec->attenuationRegister = -1;
+    rec->positionRegister = -1;
+    rec->lightSpace = LightingSpace::World;
     int minConstReg = kMaxConstantRegisters;
 
     for (size_t i = 0; i < rec->ir.size(); ++i) {
@@ -686,6 +700,12 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
     if (rec->isFFPLighting && minConstReg < kMaxConstantRegisters) {
         rec->lightingConstantBase = minConstReg;
+        rec->lightDirectionRegister = minConstReg;
+        rec->lightColorRegister = minConstReg + 1;
+        rec->positionRegister = minConstReg + 2;
+        rec->attenuationRegister = minConstReg + 3;
+        rec->materialColorRegister = minConstReg + 1;
+        rec->lightSpace = LightingSpace::View;
     }
     rec->isRemixSafe = !rec->usesFlowControl;
 }
@@ -767,6 +787,27 @@ static bool g_perfInitialized = false;
 static std::deque<std::string> g_logLines = {};
 static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
+static RemixLightingManager g_remixLightingManager = {};
+
+static ShaderLightingMetadata BuildLightingMetadataForShader(uintptr_t shaderKey) {
+    ShaderLightingMetadata meta = {};
+    auto it = g_shaderRecords.find(shaderKey);
+    if (it == g_shaderRecords.end()) {
+        return meta;
+    }
+    const ShaderRecord& rec = it->second;
+    meta.isFFPLighting = rec.isFFPLighting;
+    meta.lightDirectionRegister = rec.lightDirectionRegister;
+    meta.lightColorRegister = rec.lightColorRegister;
+    meta.materialColorRegister = rec.materialColorRegister;
+    meta.attenuationRegister = rec.attenuationRegister;
+    meta.positionRegister = rec.positionRegister;
+    meta.lightingConstantBase = (g_manualLightingBaseOverride >= 0) ? g_manualLightingBaseOverride : rec.lightingConstantBase;
+    meta.lightSpace = rec.lightSpace;
+    meta.constantUsage = rec.constantUsage;
+    meta.constantCount = kMaxConstantRegisters;
+    return meta;
+}
 
 struct MemoryScanHit {
     std::string label;
@@ -3022,6 +3063,11 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
+        if (ImGui::BeginTabItem("Lights")) {
+            DrawRemixLightsTab(g_remixLightingManager);
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("Constants")) {
             g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
@@ -4451,6 +4497,7 @@ private:
     int m_viewLockedRegister = -1;
     uintptr_t m_projLockedShader = 0;
     int m_projLockedRegister = -1;
+    bool m_remixFrameOpen = false;
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
@@ -4478,6 +4525,11 @@ public:
             m_realEx = nullptr;
         }
         LogMsg("WrappedD3D9Device destroyed");
+    }
+
+    void SubmitLightingFromCurrentDraw() {
+        ShaderLightingMetadata meta = BuildLightingMetadataForShader(g_activeVertexShaderKey);
+        g_remixLightingManager.ProcessDrawCall(meta, g_vsConstants, m_currentWorld, m_currentView, m_hasWorld, m_hasView);
     }
 
     void EmitFixedFunctionTransforms() {
@@ -5434,6 +5486,10 @@ public:
             }
         }
 
+        if (m_remixFrameOpen) {
+            g_remixLightingManager.EndFrame();
+            m_remixFrameOpen = false;
+        }
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
 
@@ -5501,6 +5557,10 @@ public:
             m_viewLockedRegister = -1;
             m_projLockedShader = 0;
             m_projLockedRegister = -1;
+        }
+        if (!m_remixFrameOpen) {
+            g_remixLightingManager.BeginFrame();
+            m_remixFrameOpen = true;
         }
         return m_real->BeginScene();
     }
@@ -5656,6 +5716,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
         if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
@@ -5665,6 +5726,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
         if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
@@ -5674,6 +5736,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
@@ -5681,6 +5744,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }
@@ -6205,6 +6269,7 @@ static void EnsureProxyInitialized() {
             LogMsg("Game display name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
         }
         g_hD3D9 = LoadTargetD3D9();
+        g_remixLightingManager.Initialize(g_config.remixDllName);
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
             g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hD3D9, "Direct3DCreate9Ex");
